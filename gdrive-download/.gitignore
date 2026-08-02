@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+*.py[cod]
+
+# Local secrets and downloaded artifacts
+token.json
+credentials.json
+cookie.txt
+cookies.txt
+*.cookies.txt
+keys_database.csv
+.license.json
+downloads/
+.gdrive_downloader_ui_settings.json
+*.part
+*.idm.json
+
+# Build outputs
+dist/
+build/

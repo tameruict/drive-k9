@@ -1,0 +1,71 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local secrets and credentials
+.env
+.env.*
+credentials.json
+token.json
+cookie.txt
+cookies.txt
+*.cookies.txt
+keys_database.csv
+.license.json
+
+# Generated sync/reconcile outputs
+drive_copy_log.json
+blocked_missing.json
+drive_missing.json
+drive_reconcile_report.json
+drive_reconcile_report.xlsx
+Bao_Cao_Copy_Drive.xlsx
+sync_checkpoint.json
+sync_state.json
+sync_state.json.tmp
+*.xlsx
+*.log
+
+# Downloaded/generated data
+downloaded_pdfs/
+downloaded_pdfs_dedup/
+test_out/
+test_out2/
+test_out3/
+test_out_fix/
+test_out_stress/
+test_out_thread/
+blocked_pdfs.json
+blocked_pdfs.txt
+blocked_pdfs_log.md
+blocked_pdf_ids.txt
+blocked_pdf_upload_checkpoint.json
+batch_downloader_checkpoint.json
+file_folder_mapping.json
+upload_plan.json
+dedup_ids.txt
+memory/
+gdrive-download.zip
+.claude/
+
+# Downloader local state/build artifacts
+gdrive-download/.gdrive_downloader_ui_settings.json
+gdrive-download/dist/
+gdrive-download/build/
+gdrive-download/downloads/
+*.part
+*.idm.json
+
+# Editor/OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
