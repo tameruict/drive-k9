@@ -44,3 +44,26 @@ python windows_sync_tool_improved.py --no-input-prompt
 `token.json`, `cookie.txt`, checkpoint, log, bao cao va cac file da tai deu
 duoc loai khoi Git.
 
+## Re-upload video ClassIn
+
+Workflow `ClassIn Video Reupload` nhan hai payload tam thoi duoc tao tu
+`video_manifest.v1.private.json`. Manifest chuan chi luu mot media mot lan,
+giu cac URL mirror lam fallback va anh xa media den dung bai hoc.
+
+```powershell
+python "E:\Chui Bailearn\CLASSIN_CRAWLER_V2_20260819\video_manifest.py" publish-actions `
+  --manifest "E:\Chui Bailearn\CLASSIN_CRAWLER_V2_20260819\final_math_20260819\video_manifest.v1.private.json" `
+  --repo tameruict/drive-k9
+
+gh workflow run classin_reupload.yml `
+  --repo tameruict/drive-k9 `
+  -f dest_folder_id=DEST_FOLDER_ID `
+  -f max_workers=3
+```
+
+Sau khi run thanh cong, xoa hai secret payload:
+
+```powershell
+python "E:\Chui Bailearn\CLASSIN_CRAWLER_V2_20260819\video_manifest.py" cleanup-actions `
+  --repo tameruict/drive-k9
+```

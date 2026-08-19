@@ -35,3 +35,26 @@ gh workflow run drive_k9.yml --repo tameruict/drive-k9
 Khong commit `token.json`, `cookie.txt`, file da tai, checkpoint, log hoac bao
 cao vao repository.
 
+## ClassIn Video Reupload
+
+Workflow `.github/workflows/classin_reupload.yml` upload MP4 truc tiep tu HTTP
+Range sang Google Drive bang resumable upload. Workflow chi can `DRIVE_TOKEN`
+va hai repository secrets tam thoi:
+
+- `CLASSIN_VIDEO_MEDIA`: danh sach media duy nhat va URL fallback.
+- `CLASSIN_VIDEO_MAPPING`: cay thu muc, ten file va activity mapping.
+
+Hai secret nay duoc tao boi lenh `video_manifest.py publish-actions`; URL khong
+duoc dua vao workflow input, log, checkpoint hoac report. Workflow upload mot
+ban cho moi `media_id`, sau do tao Drive shortcut cho cac bai hoc dung lai media.
+
+```powershell
+gh workflow run classin_reupload.yml `
+  --repo tameruict/drive-k9 `
+  -f dest_folder_id=DEST_FOLDER_ID `
+  -f max_workers=3
+```
+
+Checkpoint duoc cache giua cac run. Neu URL chinh hong, uploader thu cac mirror
+theo thu tu trong manifest. Sau khi hoan tat, xoa hai secret payload bang
+`video_manifest.py cleanup-actions`.

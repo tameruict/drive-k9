@@ -15,6 +15,7 @@ env/
 .env.*
 credentials.json
 token.json
+token-*.json
 cookie.txt
 cookies.txt
 *.cookies.txt
@@ -51,6 +52,11 @@ blocked_pdf_upload_checkpoint.json
 batch_downloader_checkpoint.json
 file_folder_mapping.json
 upload_plan.json
+video_manifest.v*.private.json
+classin_media.json
+classin_mapping.json
+classin_reupload_checkpoint.json
+classin_reupload_report.json
 dedup_ids.txt
 memory/
 gdrive-download.zip
