@@ -35,6 +35,42 @@ gh workflow run drive_k9.yml --repo tameruict/drive-k9
 Khong commit `token.json`, `cookie.txt`, file da tai, checkpoint, log hoac bao
 cao vao repository.
 
+## Sangsang ĐGNL BCA: HLS -> MP4 -> Google Drive
+
+Workflow `.github/workflows/sangsang_dgnl_bca.yml` tu dong tai JSON khoa hoc
+Sangsang, giu nguyen cay nhom tren giao dien, dung link `/api/playlist` cua web
+de doc HLS, dung `ffmpeg` dong goi MP4 va upload resumable vao Drive. Moi video
+duoc luu trong folder nhom tuong ung, co checkpoint va bo qua file da upload.
+
+Chi can repository secret `DRIVE_TOKEN` la OAuth `token.json` co quyen Drive.
+Khong can `DRIVE_COOKIE`. `dest_folder_id` la folder goc trong Drive cua anh.
+
+Chay canary mot bai truoc:
+
+```powershell
+gh workflow run sangsang_dgnl_bca.yml `
+  --repo tameruict/drive-k9 `
+  -f course_slug=dgnl-bca `
+  -f dest_folder_id=DEST_FOLDER_ID `
+  -f max_workers=1 `
+  -f limit=1
+```
+
+Chay toan bo 471 bai:
+
+```powershell
+gh workflow run sangsang_dgnl_bca.yml `
+  --repo tameruict/drive-k9 `
+  -f course_slug=dgnl-bca `
+  -f dest_folder_id=DEST_FOLDER_ID `
+  -f max_workers=1 `
+  -f limit=0
+```
+
+Bao cao `sangsang_reupload_report.json` se ghi ro `uploaded`, `existing`,
+`checkpoint`, `skipped_missing_hls` va `failed`. Hai bai Lich su khong co HLS
+trong du lieu khoa hoc se duoc danh dau `skipped_missing_hls`.
+
 ## ClassIn Video Reupload
 
 Workflow `.github/workflows/classin_reupload.yml` upload MP4 truc tiep tu HTTP
