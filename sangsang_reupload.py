@@ -13,11 +13,13 @@ import hashlib
 import json
 import os
 import pathlib
+import queue
 import re
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -45,6 +47,10 @@ DRIVE_ID = re.compile(r"^[A-Za-z0-9_-]{10,}$")
 
 def sanitize_error(error: BaseException | str) -> str:
     return URL_RE.sub("<url>", str(error))[:1000]
+
+
+def progress(message: str) -> None:
+    print(message, flush=True)
 
 
 def atomic_write_json(path: pathlib.Path, payload: dict[str, Any]) -> None:
@@ -262,6 +268,8 @@ class DriveClient:
         return str(created["id"])
 
     def upload_mp4(self, path: pathlib.Path, lesson: Lesson, parent_id: str, dest_root: str) -> dict[str, Any]:
+        total_size = path.stat().st_size
+        progress(f"UPLOAD_START lesson={lesson.key} name={lesson.file_name} bytes={total_size}")
         media = MediaFileUpload(str(path), mimetype=VIDEO_MIME, chunksize=UPLOAD_CHUNK_SIZE, resumable=True)
         body = {
             "name": lesson.file_name,
@@ -280,8 +288,15 @@ class DriveClient:
             supportsAllDrives=True,
         )
         response = None
+        last_report = -1
         while response is None:
-            _, response = request.next_chunk(num_retries=3)
+            status, response = request.next_chunk(num_retries=3)
+            if status is not None:
+                percent = int(status.progress() * 100)
+                if percent >= last_report + 10 or percent == 100:
+                    progress(f"UPLOAD_PROGRESS lesson={lesson.key} percent={percent}")
+                    last_report = percent
+        progress(f"UPLOAD_DONE lesson={lesson.key} drive_file={response['id']} bytes={response.get('size', total_size)}")
         return dict(response)
 
 
@@ -344,6 +359,7 @@ def download_hls_to_mp4(
     playlist: pathlib.Path,
     output: pathlib.Path,
     timeout: int = 7200,
+    label: str = "",
 ) -> None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -360,6 +376,9 @@ def download_hls_to_mp4(
         "file,http,https,tcp,tls,crypto",
         "-rw_timeout",
         "30000000",
+        "-progress",
+        "pipe:1",
+        "-nostats",
         "-i",
         str(playlist),
         "-map",
@@ -374,9 +393,51 @@ def download_hls_to_mp4(
         "+faststart",
         str(output),
     ]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg exit {result.returncode}: {sanitize_error(result.stderr)}")
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    events: queue.Queue[tuple[str, str]] = queue.Queue()
+
+    def read_progress() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            events.put(("progress", line.strip()))
+        events.put(("eof", ""))
+
+    reader = threading.Thread(target=read_progress, daemon=True)
+    reader.start()
+    started = time.monotonic()
+    last_log = started - 30
+    last_time = "00:00:00.000"
+    while True:
+        if time.monotonic() - started > timeout:
+            process.kill()
+            process.wait(timeout=15)
+            raise TimeoutError(f"ffmpeg timed out after {timeout}s")
+        try:
+            kind, value = events.get(timeout=1)
+        except queue.Empty:
+            if process.poll() is not None and not reader.is_alive():
+                break
+            continue
+        if kind == "progress":
+            if value.startswith("out_time="):
+                last_time = value.split("=", 1)[1]
+            if value == "progress=end":
+                progress(f"DOWNLOAD_PROGRESS lesson={label} out_time={last_time}")
+            elif time.monotonic() - last_log >= 30:
+                progress(f"DOWNLOAD_PROGRESS lesson={label} out_time={last_time}")
+                last_log = time.monotonic()
+        elif kind == "eof" and process.poll() is not None:
+            break
+    return_code = process.wait(timeout=15)
+    stderr = process.stderr.read() if process.stderr is not None else ""
+    if return_code != 0:
+        raise RuntimeError(f"ffmpeg exit {return_code}: {sanitize_error(stderr)}")
     if not output.exists() or output.stat().st_size < 1024:
         raise RuntimeError("ffmpeg produced an empty or invalid MP4")
 
@@ -419,9 +480,11 @@ class SangsangReupload:
         for lesson in self.lessons:
             for depth in range(1, len(lesson.path) + 1):
                 unique_paths.setdefault(lesson.drive_path[:depth], None)
-        for path in unique_paths:
+        progress(f"FOLDERS_START count={len(unique_paths)}")
+        for index, path in enumerate(unique_paths, start=1):
             parent = self.folder_ids[path[:-1]]
             self.folder_ids[path] = client.ensure_folder(parent, path[-1])
+            progress(f"FOLDER_READY index={index}/{len(unique_paths)} path={' / '.join(path)}")
 
     @staticmethod
     def valid_existing(metadata: dict | None) -> bool:
@@ -435,7 +498,12 @@ class SangsangReupload:
     def run(self) -> dict[str, Any]:
         if not self.lessons:
             raise RuntimeError("No video lessons found")
+        progress(
+            f"RUN_START course={self.slug} lessons={len(self.lessons)} "
+            f"hls={sum(bool(item.playback_hls) for item in self.lessons)} workers={self.max_workers}"
+        )
         self.prepare_folders()
+        progress("FOLDERS_COMPLETE")
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             futures = {pool.submit(self.process_lesson, lesson): lesson.key for lesson in self.lessons}
             for future in as_completed(futures):
@@ -448,7 +516,7 @@ class SangsangReupload:
                         self.stats["failed"] += 1
                 with self.lock:
                     self.results.append(result)
-                    print(json.dumps(result, ensure_ascii=False))
+                    progress(json.dumps(result, ensure_ascii=False))
         report = {
             "version": 1,
             "source": course_json_url(self.slug, self.base_url),
@@ -470,6 +538,10 @@ class SangsangReupload:
         return report
 
     def process_lesson(self, lesson: Lesson) -> dict[str, Any]:
+        progress(
+            f"LESSON_START lesson={lesson.key} group={' / '.join(lesson.path)} "
+            f"name={lesson.file_name}"
+        )
         if not lesson.playback_hls:
             with self.lock:
                 self.stats["skipped_missing_hls"] += 1
@@ -500,6 +572,7 @@ class SangsangReupload:
             output = pathlib.Path(tmp) / lesson.file_name
             with requests.Session() as hls_session:
                 hls_session.headers.update({"User-Agent": "drive-k9-sangsang/1.0"})
+                progress(f"PLAYLIST_START lesson={lesson.key}")
                 playlist = prepare_local_media_playlist(
                     lesson.source_hls,
                     lesson.file_id,
@@ -507,7 +580,14 @@ class SangsangReupload:
                     pathlib.Path(tmp),
                     hls_session,
                 )
-            download_hls_to_mp4(playlist, output, timeout=self.download_timeout)
+            progress(f"DOWNLOAD_START lesson={lesson.key} playlist=ready")
+            download_hls_to_mp4(
+                playlist,
+                output,
+                timeout=self.download_timeout,
+                label=lesson.key,
+            )
+            progress(f"DOWNLOAD_DONE lesson={lesson.key} bytes={output.stat().st_size}")
             uploaded = client.upload_mp4(output, lesson, parent_id, self.dest_root)
         file_id = str(uploaded["id"])
         size = int(uploaded.get("size") or 0)
@@ -558,6 +638,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--force-retry", action="store_true")
     parser.add_argument("--limit", type=int, default=0, help="Process only the first N lessons; 0 means all")
+    parser.add_argument(
+        "--top-group-index",
+        type=int,
+        default=-1,
+        help="Only process one top-level UI group (0-9); -1 means all groups",
+    )
     return parser.parse_args()
 
 
@@ -584,6 +670,16 @@ def main() -> int:
         args.base_url,
         args.download_timeout,
     )
+    if args.top_group_index >= 0:
+        top_groups = list(dict.fromkeys(lesson.path[0] for lesson in engine.lessons))
+        if args.top_group_index >= len(top_groups):
+            raise ValueError(f"top-group-index must be between 0 and {len(top_groups) - 1}")
+        selected_top = top_groups[args.top_group_index]
+        engine.lessons = [lesson for lesson in engine.lessons if lesson.path[0] == selected_top]
+        progress(
+            f"SHARD_SELECTED index={args.top_group_index} name={selected_top} "
+            f"lessons={len(engine.lessons)}"
+        )
     if args.limit > 0:
         engine.lessons = engine.lessons[: args.limit]
     report = engine.run()

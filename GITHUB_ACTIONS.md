@@ -41,20 +41,24 @@ Workflow `.github/workflows/sangsang_dgnl_bca.yml` tu dong tai JSON khoa hoc
 Sangsang, giu nguyen cay nhom tren giao dien, danh so folder theo thu tu `01 -`,
 `02 -` va bai hoc theo `001 -`, `002 -`, dung link `/api/playlist` cua web de doc
 HLS, dung `ffmpeg` dong goi MP4 va upload resumable vao Drive. Moi video duoc
-luu trong folder nhom tuong ung, co checkpoint va bo qua file da upload.
+luu trong folder nhom tuong ung, co checkpoint va bo qua file da upload. Workflow
+tach thanh 10 job theo 10 nhom cap 1, de cac nhom co the chay song song thay vi
+cho xong ca khoa moi bat dau nhom tiep theo.
 
 Chi can repository secret `DRIVE_TOKEN` la OAuth `token.json` co quyen Drive.
 Khong can `DRIVE_COOKIE`. `dest_folder_id` nhan ca ID thuan hoac full URL folder
 Drive cua anh.
 
-Chay canary mot bai truoc:
+Chay canary: moi job lay 1 bai dau tien cua nhom, toi da 10 bai:
 
 ```powershell
 gh workflow run sangsang_dgnl_bca.yml `
-  --repo tameruict/drive-k9 `
+  --repo tameruict/drive-vercel `
   -f course_slug=dgnl-bca `
   -f dest_folder_id=DEST_FOLDER_ID `
   -f max_workers=1 `
+  -f download_timeout=7200 `
+  -f force_retry=false `
   -f limit=1
 ```
 
@@ -62,12 +66,20 @@ Chay toan bo 471 bai:
 
 ```powershell
 gh workflow run sangsang_dgnl_bca.yml `
-  --repo tameruict/drive-k9 `
+  --repo tameruict/drive-vercel `
   -f course_slug=dgnl-bca `
   -f dest_folder_id=DEST_FOLDER_ID `
   -f max_workers=1 `
+  -f download_timeout=7200 `
+  -f force_retry=false `
   -f limit=0
 ```
+
+Mỗi job hien cac dong `FOLDERS_COMPLETE`, `LESSON_START`,
+`DOWNLOAD_PROGRESS`, `UPLOAD_PROGRESS` va `UPLOAD_DONE`. Video chi xuat hien
+tren Drive sau khi ffmpeg dong goi xong video do; trong luc do runner dang tai
+cac segment HLS. Neu mot job loi, chay lai cung tham so se dung checkpoint cua
+nhom do va bo qua cac file da hoan tat.
 
 Bao cao `sangsang_reupload_report.json` se ghi ro `uploaded`, `existing`,
 `checkpoint`, `skipped_missing_hls` va `failed`. Hai bai Lich su khong co HLS

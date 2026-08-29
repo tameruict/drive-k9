@@ -45,13 +45,39 @@ concurrency:
 
 jobs:
   upload:
-    name: Upload Sangsang videos to Drive
+    name: Upload Sangsang videos - Group ${{ matrix.group }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include:
+          - group: "01"
+            group_index: 0
+          - group: "02"
+            group_index: 1
+          - group: "03"
+            group_index: 2
+          - group: "04"
+            group_index: 3
+          - group: "05"
+            group_index: 4
+          - group: "06"
+            group_index: 5
+          - group: "07"
+            group_index: 6
+          - group: "08"
+            group_index: 7
+          - group: "09"
+            group_index: 8
+          - group: "10"
+            group_index: 9
     env:
       COURSE_SLUG: ${{ inputs.course_slug }}
       DEST_FOLDER_ID: ${{ inputs.dest_folder_id }}
       MAX_WORKERS: ${{ inputs.max_workers }}
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout source
@@ -82,9 +108,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: sangsang_reupload_checkpoint.json
-          key: sangsang-${{ inputs.course_slug }}-${{ inputs.dest_folder_id }}-${{ github.run_id }}
+          key: sangsang-${{ inputs.course_slug }}-${{ inputs.dest_folder_id }}-group-${{ matrix.group_index }}-${{ github.run_id }}
           restore-keys: |
-            sangsang-${{ inputs.course_slug }}-${{ inputs.dest_folder_id }}-
+            sangsang-${{ inputs.course_slug }}-${{ inputs.dest_folder_id }}-group-${{ matrix.group_index }}-
 
       - name: Create temporary Drive credentials
         env:
@@ -110,13 +136,14 @@ jobs:
           if [[ "${{ inputs.force_retry }}" == "true" ]]; then
             extra+=(--force-retry)
           fi
-          python sangsang_reupload.py \
+          python -u sangsang_reupload.py \
             --course-slug "$COURSE_SLUG" \
             --token-file "$RUNNER_TEMP/token.json" \
             --dest-folder-id "$DEST_FOLDER_ID" \
             --max-workers "$MAX_WORKERS" \
             --download-timeout "${{ inputs.download_timeout }}" \
             --limit "${{ inputs.limit }}" \
+            --top-group-index "${{ matrix.group_index }}" \
             --checkpoint-file sangsang_reupload_checkpoint.json \
             --report-file sangsang_reupload_report.json \
             "${extra[@]}"
@@ -125,7 +152,7 @@ jobs:
         if: always() && hashFiles('sangsang_reupload_report.json') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: sangsang-reupload-report-${{ github.run_id }}
+          name: sangsang-reupload-report-${{ github.run_id }}-group-${{ matrix.group_index }}
           path: sangsang_reupload_report.json
           if-no-files-found: error
           retention-days: 30
@@ -135,7 +162,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: sangsang_reupload_checkpoint.json
-          key: sangsang-${{ inputs.course_slug }}-${{ inputs.dest_folder_id }}-${{ github.run_id }}
+          key: sangsang-${{ inputs.course_slug }}-${{ inputs.dest_folder_id }}-group-${{ matrix.group_index }}-${{ github.run_id }}
 
       - name: Remove temporary credentials
         if: always()

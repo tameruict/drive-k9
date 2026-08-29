@@ -161,12 +161,29 @@ class FfmpegTests(unittest.TestCase):
             playlist = pathlib.Path(tmp) / "media.m3u8"
             playlist.write_text("#EXTM3U\n", encoding="utf-8")
 
-            def fake_run(command, **kwargs):
+            class FakeProcess:
+                def __init__(self):
+                    self.stdout = iter(["out_time=00:00:02.000\n", "progress=end\n"])
+                    self.stderr = type("Err", (), {"read": lambda self: ""})()
+
+                def poll(self):
+                    return 0
+
+                def wait(self, timeout=None):
+                    return 0
+
+                def communicate(self, timeout=None):
+                    return "", ""
+
+                def kill(self):
+                    return None
+
+            def fake_popen(command, **kwargs):
                 output.write_bytes(b"0" * 2048)
-                return type("Completed", (), {"returncode": 0, "stderr": ""})()
+                return FakeProcess()
 
             with patch.object(app.shutil, "which", return_value="ffmpeg"), patch.object(
-                app.subprocess, "run", side_effect=fake_run
+                app.subprocess, "Popen", side_effect=fake_popen
             ) as run:
                 app.download_hls_to_mp4(playlist, output)
 
