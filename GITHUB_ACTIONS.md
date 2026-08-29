@@ -38,9 +38,10 @@ cao vao repository.
 ## Sangsang ĐGNL BCA: HLS -> MP4 -> Google Drive
 
 Workflow `.github/workflows/sangsang_dgnl_bca.yml` tu dong tai JSON khoa hoc
-Sangsang, giu nguyen cay nhom tren giao dien, dung link `/api/playlist` cua web
-de doc HLS, dung `ffmpeg` dong goi MP4 va upload resumable vao Drive. Moi video
-duoc luu trong folder nhom tuong ung, co checkpoint va bo qua file da upload.
+Sangsang, giu nguyen cay nhom tren giao dien, danh so folder theo thu tu `01 -`,
+`02 -` va bai hoc theo `001 -`, `002 -`, dung link `/api/playlist` cua web de doc
+HLS, dung `ffmpeg` dong goi MP4 va upload resumable vao Drive. Moi video duoc
+luu trong folder nhom tuong ung, co checkpoint va bo qua file da upload.
 
 Chi can repository secret `DRIVE_TOKEN` la OAuth `token.json` co quyen Drive.
 Khong can `DRIVE_COOKIE`. `dest_folder_id` la folder goc trong Drive cua anh.

@@ -52,7 +52,8 @@ class SangsangManifestTests(unittest.TestCase):
         lessons = app.flatten_course(COURSE)
         self.assertEqual([lesson.key for lesson in lessons], ["101", "102"])
         self.assertEqual(lessons[0].path, ("Nhóm chính", "Nhóm con"))
-        self.assertEqual(lessons[0].file_name, "001 - Bài một test.mp4")
+        self.assertEqual(lessons[0].drive_path, ("01 - Nhóm chính", "01 - Nhóm con"))
+        self.assertEqual(lessons[0].file_name, "001 - Bài một test [bai-101].mp4")
         self.assertTrue(lessons[0].playback_hls)
         self.assertEqual(lessons[1].playback_hls, "")
 
@@ -66,6 +67,17 @@ class SangsangManifestTests(unittest.TestCase):
     def test_safe_filename_removes_path_and_reserved_characters(self):
         name = app.safe_filename('A/B: C? "D"', 7)
         self.assertEqual(name, "007 - A B C D.mp4")
+
+    def test_drive_path_numbers_sibling_sections_in_ui_order(self):
+        course = {
+            "sections": [
+                {"title": "Một", "items": [{"type": "video", "title": "A", "lessonId": 1, "fileId": 2, "hls": "x"}]},
+                {"title": "Hai", "items": [{"type": "video", "title": "B", "lessonId": 3, "fileId": 4, "hls": "y"}]},
+            ]
+        }
+        lessons = app.flatten_course(course)
+        self.assertEqual(lessons[0].drive_path, ("01 - Một",))
+        self.assertEqual(lessons[1].drive_path, ("02 - Hai",))
 
     def test_checkpoint_rejects_different_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:

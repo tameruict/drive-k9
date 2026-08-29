@@ -57,10 +57,11 @@ def drive_query_literal(value: str) -> str:
     return str(value).replace("\\", "\\\\").replace("'", "\\'")
 
 
-def safe_filename(title: str, order: int) -> str:
+def safe_filename(title: str, order: int, lesson_id: str = "") -> str:
     value = INVALID_FILENAME.sub(" ", str(title or "Bai hoc"))
     value = re.sub(r"\s+", " ", value).strip(" .") or "Bai hoc"
-    return f"{order:03d} - {value[:170]}.mp4"
+    suffix = f" [bai-{lesson_id}]" if lesson_id else ""
+    return f"{order:03d} - {value[: max(1, 170 - len(suffix))]}{suffix}.mp4"
 
 
 def course_json_url(slug: str, base_url: str = DEFAULT_BASE_URL) -> str:
@@ -111,6 +112,7 @@ class Lesson:
     file_id: str
     title: str
     path: tuple[str, ...]
+    drive_path: tuple[str, ...]
     order: int
     source_hls: str
     playback_hls: str
@@ -120,9 +122,16 @@ class Lesson:
 def flatten_course(course: dict[str, Any], base_url: str = DEFAULT_BASE_URL) -> list[Lesson]:
     lessons: list[Lesson] = []
 
-    def walk(sections: list[dict[str, Any]], path: tuple[str, ...] = ()) -> None:
-        for section in sections or []:
+    def walk(
+        sections: list[dict[str, Any]],
+        path: tuple[str, ...] = (),
+        drive_path: tuple[str, ...] = (),
+    ) -> None:
+        for section_index, section in enumerate(sections or [], start=1):
             current = path + (str(section.get("title") or "Chua dat ten"),)
+            current_drive_path = drive_path + (
+                f"{section_index:02d} - {current[-1]}",
+            )
             local_order = 0
             for item in section.get("items", []) or []:
                 if item.get("type") != "video":
@@ -141,13 +150,18 @@ def flatten_course(course: dict[str, Any], base_url: str = DEFAULT_BASE_URL) -> 
                         file_id=file_id,
                         title=str(item.get("title") or "Bai hoc"),
                         path=current,
+                        drive_path=current_drive_path,
                         order=local_order,
                         source_hls=source_hls,
                         playback_hls=playback_hls_url(source_hls, file_id, base_url),
-                        file_name=safe_filename(str(item.get("title") or "Bai hoc"), local_order),
+                        file_name=safe_filename(
+                            str(item.get("title") or "Bai hoc"),
+                            local_order,
+                            lesson_id,
+                        ),
                     )
                 )
-            walk(section.get("children", []) or [], current)
+            walk(section.get("children", []) or [], current, current_drive_path)
 
     walk(course.get("sections", []) or [])
     if len({lesson.key for lesson in lessons}) != len(lessons):
@@ -388,7 +402,7 @@ class SangsangReupload:
         unique_paths: OrderedDict[tuple[str, ...], None] = OrderedDict()
         for lesson in self.lessons:
             for depth in range(1, len(lesson.path) + 1):
-                unique_paths.setdefault(lesson.path[:depth], None)
+                unique_paths.setdefault(lesson.drive_path[:depth], None)
         for path in unique_paths:
             parent = self.folder_ids[path[:-1]]
             self.folder_ids[path] = client.ensure_folder(parent, path[-1])
@@ -447,6 +461,7 @@ class SangsangReupload:
                 "lesson_id": lesson.key,
                 "title": lesson.title,
                 "group": " / ".join(lesson.path),
+                "drive_group": " / ".join(lesson.drive_path),
                 "status": "skipped_missing_hls",
             }
 
@@ -464,7 +479,7 @@ class SangsangReupload:
                 self._save_checkpoint(lesson, existing["id"], int(existing.get("size") or 0))
                 return self._result(lesson, "existing", existing["id"], int(existing.get("size") or 0))
 
-        parent_id = self.folder_ids[lesson.path]
+        parent_id = self.folder_ids[lesson.drive_path]
         with tempfile.TemporaryDirectory(prefix="sangsang-") as tmp:
             output = pathlib.Path(tmp) / lesson.file_name
             with requests.Session() as hls_session:
@@ -491,7 +506,8 @@ class SangsangReupload:
                 "file_id": file_id,
                 "size": size,
                 "name": lesson.file_name,
-                "path": list(lesson.path),
+                "path": list(lesson.drive_path),
+                "display_path": list(lesson.path),
             }
             atomic_write_json(self.checkpoint_file, self.checkpoint)
 
@@ -501,6 +517,7 @@ class SangsangReupload:
             "lesson_id": lesson.key,
             "title": lesson.title,
             "group": " / ".join(lesson.path),
+            "drive_group": " / ".join(lesson.drive_path),
             "status": status,
             "file_id": file_id,
             "size": int(size or 0),
