@@ -1,7 +1,9 @@
 import json
 import pathlib
+import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import sangsang_reupload as app
@@ -40,6 +42,25 @@ COURSE = {
 
 
 class SangsangManifestTests(unittest.TestCase):
+    def test_empty_shard_is_successful_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "report.json"
+            engine = app.SangsangReupload(
+                {"title": "Empty", "sections": []},
+                "demo",
+                object(),
+                "dest",
+                pathlib.Path(tmp) / "checkpoint.json",
+                report,
+                1,
+                False,
+                app.DEFAULT_BASE_URL,
+                60,
+            )
+            result = engine.run()
+            self.assertEqual(result["stats"]["lessons_total"], 0)
+            self.assertTrue(report.exists())
+
     def test_extract_drive_folder_id_accepts_raw_id_and_full_url(self):
         folder_id = "1AbC_def-ghiJKLMnopQRSTuvWX"
         self.assertEqual(app.extract_drive_folder_id(folder_id), folder_id)
@@ -126,6 +147,33 @@ class SangsangManifestTests(unittest.TestCase):
 
 
 class FfmpegTests(unittest.TestCase):
+    def test_fast_download_uses_concurrent_fragments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "out.mp4"
+            playlist = pathlib.Path(tmp) / "media.m3u8"
+            playlist.write_text("#EXTM3U\n#EXTINF:2,\nsegment.ts\n", encoding="utf-8")
+            captured = {}
+
+            class FakeYoutubeDL:
+                def __init__(self, options):
+                    captured.update(options)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def download(self, urls):
+                    pathlib.Path(captured["outtmpl"].replace("%(ext)s", "mp4")).write_bytes(b"0" * 2048)
+
+            with patch.dict(sys.modules, {"yt_dlp": SimpleNamespace(YoutubeDL=FakeYoutubeDL)}):
+                app.download_hls_to_mp4(playlist, output, fragment_concurrency=8)
+
+            self.assertEqual(captured["concurrent_fragment_downloads"], 8)
+            self.assertTrue(captured["enable_file_urls"])
+            self.assertTrue(output.exists())
+
     def test_local_playlist_rewrites_key_and_segments(self):
         class Response:
             def __init__(self, text):

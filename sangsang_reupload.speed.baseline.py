@@ -36,7 +36,6 @@ from googleapiclient.http import MediaFileUpload
 DEFAULT_BASE_URL = "https://sangsang-thuvien.vercel.app/"
 DEFAULT_COURSE_SLUG = "dgnl-bca"
 DEFAULT_DOWNLOAD_TIMEOUT = 7200
-DEFAULT_FRAGMENT_CONCURRENCY = 4
 VIDEO_MIME = "video/mp4"
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
@@ -209,20 +208,6 @@ def load_checkpoint(path: pathlib.Path, signature: str) -> dict[str, Any]:
     return {"version": 1, "signature": signature, "lessons": {}}
 
 
-def load_shard_keys(path: pathlib.Path, signature: str, shard_index: int) -> set[str]:
-    """Load one planner shard and reject stale or malformed plans."""
-    payload = json.loads(path.read_text(encoding="utf-8-sig"))
-    if payload.get("signature") != signature:
-        raise ValueError("Shard plan signature does not match the course manifest")
-    shards = payload.get("shards") or []
-    if shard_index < 0 or shard_index >= len(shards):
-        raise ValueError(f"shard-index must be between 0 and {len(shards) - 1}")
-    keys = [str(key) for key in (shards[shard_index].get("lesson_keys") or [])]
-    if len(keys) != len(set(keys)):
-        raise ValueError("Shard plan contains duplicate lesson keys")
-    return set(keys)
-
-
 def build_credentials(token_file: pathlib.Path) -> Credentials:
     info = json.loads(token_file.read_text(encoding="utf-8-sig"))
     credentials = Credentials.from_authorized_user_info(info)
@@ -375,88 +360,11 @@ def download_hls_to_mp4(
     output: pathlib.Path,
     timeout: int = 7200,
     label: str = "",
-    fragment_concurrency: int = DEFAULT_FRAGMENT_CONCURRENCY,
 ) -> None:
-    """Download HLS fragments concurrently and remux without re-encoding."""
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fragment_concurrency = max(1, int(fragment_concurrency))
-    # Do not invoke an extractor for an empty test/partial playlist.  This
-    # also prevents a malformed response from spending the whole job timeout
-    # in the fast path before the compatibility fallback gets a chance.
-    playlist_text = playlist.read_text(encoding="utf-8", errors="replace")
-    has_segments = "#EXTINF:" in playlist_text or "#EXT-X-MAP:" in playlist_text
-    try:
-        import yt_dlp
-    except ImportError:
-        yt_dlp = None
-
-    if yt_dlp is not None and has_segments:
-        started = time.monotonic()
-        last_log = started - 30
-
-        def hook(event: dict[str, Any]) -> None:
-            nonlocal last_log
-            now = time.monotonic()
-            if now - started > timeout:
-                raise yt_dlp.utils.DownloadError(f"HLS download timed out after {timeout}s")
-            if event.get("status") == "downloading" and now - last_log >= 30:
-                downloaded = event.get("downloaded_bytes") or 0
-                total = event.get("total_bytes") or event.get("total_bytes_estimate") or 0
-                percent = f" percent={downloaded / total * 100:.1f}" if total else ""
-                progress(
-                    f"DOWNLOAD_PROGRESS lesson={label} downloaded={downloaded}"
-                    f" total={total}{percent} elapsed={int(now - started)}"
-                )
-                last_log = now
-
-        target = output.with_suffix(".%(ext)s")
-        opts: dict[str, Any] = {
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-            "enable_file_urls": True,
-            "outtmpl": str(target),
-            "overwrites": True,
-            "retries": 5,
-            "fragment_retries": 5,
-            "extractor_retries": 3,
-            "socket_timeout": 30,
-            "file_access_retries": 3,
-            "skip_unavailable_fragments": False,
-            "concurrent_fragment_downloads": fragment_concurrency,
-            "hls_prefer_native": True,
-            "progress_hooks": [hook],
-            "merge_output_format": "mp4",
-            "postprocessors": [
-                {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
-            ],
-        }
-        try:
-            with yt_dlp.YoutubeDL(opts) as downloader:
-                downloader.download([playlist.as_uri()])
-            candidates = [output, output.with_suffix(".mp4"), output.with_suffix(".mkv")]
-            source = next((path for path in candidates if path.exists()), None)
-            if source is not None and source != output:
-                source.replace(output)
-            if output.exists() and output.stat().st_size >= 1024:
-                progress(f"DOWNLOAD_DONE lesson={label} bytes={output.stat().st_size}")
-                return
-            raise RuntimeError("yt-dlp produced an empty or invalid MP4")
-        except Exception as exc:
-            progress(f"DOWNLOAD_FAST_PATH_FAILED lesson={label} error={sanitize_error(exc)}")
-            if output.exists():
-                output.unlink()
-            # On production runners yt-dlp is installed intentionally.  Do
-            # not silently restart the same transfer with ffmpeg, which would
-            # erase the speedup and hide a real fragment failure.  The
-            # ffmpeg fallback remains available when yt-dlp is absent or the
-            # playlist is only a compatibility/fixture playlist.
-            if has_segments:
-                raise RuntimeError(f"yt-dlp HLS download failed: {sanitize_error(exc)}") from exc
-
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        raise RuntimeError("yt-dlp and ffmpeg were not found on the runner")
+        raise RuntimeError("ffmpeg was not found on the runner")
+    output.parent.mkdir(parents=True, exist_ok=True)
     command = [
         ffmpeg,
         "-hide_banner",
@@ -547,7 +455,6 @@ class SangsangReupload:
         force_retry: bool,
         base_url: str,
         download_timeout: int,
-        fragment_concurrency: int = DEFAULT_FRAGMENT_CONCURRENCY,
     ):
         self.course = course
         self.slug = slug
@@ -559,7 +466,6 @@ class SangsangReupload:
         self.force_retry = force_retry
         self.base_url = base_url
         self.download_timeout = max(60, int(download_timeout))
-        self.fragment_concurrency = max(1, int(fragment_concurrency))
         self.lessons = flatten_course(course, base_url)
         self.signature = manifest_signature(course, slug)
         self.checkpoint = load_checkpoint(checkpoint_file, self.signature)
@@ -591,34 +497,10 @@ class SangsangReupload:
 
     def run(self) -> dict[str, Any]:
         if not self.lessons:
-            report = {
-                "version": 1,
-                "source": course_json_url(self.slug, self.base_url),
-                "course_slug": self.slug,
-                "course_title": self.course.get("title", ""),
-                "signature": self.signature,
-                "stats": {
-                    "lessons_total": 0,
-                    "hls_available": 0,
-                    "uploaded": 0,
-                    "existing": 0,
-                    "checkpoint": 0,
-                    "skipped_missing_hls": 0,
-                    "failed": 0,
-                },
-                "items": [],
-            }
-            progress(f"RUN_EMPTY course={self.slug}")
-            atomic_write_json(self.report_file, report)
-            return report
+            raise RuntimeError("No video lessons found")
         progress(
             f"RUN_START course={self.slug} lessons={len(self.lessons)} "
-            f"hls={sum(bool(item.playback_hls) for item in self.lessons)} "
-            f"workers={self.max_workers} fragments={self.fragment_concurrency}"
-        )
-        progress(
-            f"PIPELINE_MODE download_upload_overlap={'on' if self.max_workers > 1 else 'off'} "
-            f"bounded_workers={self.max_workers}"
+            f"hls={sum(bool(item.playback_hls) for item in self.lessons)} workers={self.max_workers}"
         )
         self.prepare_folders()
         progress("FOLDERS_COMPLETE")
@@ -704,7 +586,6 @@ class SangsangReupload:
                 output,
                 timeout=self.download_timeout,
                 label=lesson.key,
-                fragment_concurrency=self.fragment_concurrency,
             )
             progress(f"DOWNLOAD_DONE lesson={lesson.key} bytes={output.stat().st_size}")
             uploaded = client.upload_mp4(output, lesson, parent_id, self.dest_root)
@@ -755,12 +636,6 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("SANGSANG_DOWNLOAD_TIMEOUT", DEFAULT_DOWNLOAD_TIMEOUT)),
         help="Maximum seconds allowed for one HLS-to-MP4 conversion",
     )
-    parser.add_argument(
-        "--fragment-concurrency",
-        type=int,
-        default=int(os.environ.get("SANGSANG_FRAGMENT_CONCURRENCY", DEFAULT_FRAGMENT_CONCURRENCY)),
-        help="Concurrent HLS fragments per video when using yt-dlp",
-    )
     parser.add_argument("--force-retry", action="store_true")
     parser.add_argument("--limit", type=int, default=0, help="Process only the first N lessons; 0 means all")
     parser.add_argument(
@@ -768,18 +643,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=-1,
         help="Only process one top-level UI group (0-9); -1 means all groups",
-    )
-    parser.add_argument(
-        "--shard-plan",
-        type=pathlib.Path,
-        default=None,
-        help="Duration-weighted shard plan generated by sangsang_shard_plan.py",
-    )
-    parser.add_argument(
-        "--shard-index",
-        type=int,
-        default=-1,
-        help="Shard index to process from --shard-plan",
     )
     return parser.parse_args()
 
@@ -806,13 +669,7 @@ def main() -> int:
         args.force_retry,
         args.base_url,
         args.download_timeout,
-        args.fragment_concurrency,
     )
-    # Legacy runs without a planner apply --limit once before selecting a
-    # subject. Planner-backed runs apply the same limit while creating the
-    # global shard plan, so empty matrix jobs remain valid no-ops.
-    if args.limit > 0 and args.shard_plan is None:
-        engine.lessons = engine.lessons[: args.limit]
     if args.top_group_index >= 0:
         top_groups = list(dict.fromkeys(lesson.path[0] for lesson in engine.lessons))
         if args.top_group_index >= len(top_groups):
@@ -823,17 +680,8 @@ def main() -> int:
             f"SHARD_SELECTED index={args.top_group_index} name={selected_top} "
             f"lessons={len(engine.lessons)}"
         )
-    if args.shard_plan is not None or args.shard_index >= 0:
-        if args.shard_plan is None or args.shard_index < 0:
-            raise ValueError("--shard-plan and --shard-index must be provided together")
-        keys = load_shard_keys(args.shard_plan, engine.signature, args.shard_index)
-        before = len(engine.lessons)
-        engine.lessons = [lesson for lesson in engine.lessons if lesson.key in keys]
-        found = {lesson.key for lesson in engine.lessons}
-        if found != keys:
-            missing = sorted(keys - found)
-            raise ValueError(f"Shard plan contains lessons missing from course: {missing[:5]}")
-        progress(f"SHARD_SELECTED index={args.shard_index} lessons={len(engine.lessons)} before={before}")
+    if args.limit > 0:
+        engine.lessons = engine.lessons[: args.limit]
     report = engine.run()
     print(json.dumps(report["stats"], ensure_ascii=False))
     return 1 if report["stats"].get("failed", 0) else 0
