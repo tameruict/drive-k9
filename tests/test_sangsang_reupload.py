@@ -40,6 +40,27 @@ COURSE = {
 
 
 class SangsangManifestTests(unittest.TestCase):
+    def test_extract_drive_folder_id_accepts_raw_id_and_full_url(self):
+        folder_id = "1AbC_def-ghiJKLMnopQRSTuvWX"
+        self.assertEqual(app.extract_drive_folder_id(folder_id), folder_id)
+        self.assertEqual(
+            app.extract_drive_folder_id(
+                f"https://drive.google.com/drive/u/0/folders/{folder_id}"
+            ),
+            folder_id,
+        )
+
+    def test_extract_drive_folder_id_accepts_open_id_url(self):
+        folder_id = "1AbC_def-ghiJKLMnopQRSTuvWX"
+        self.assertEqual(
+            app.extract_drive_folder_id(f"https://drive.google.com/open?id={folder_id}"),
+            folder_id,
+        )
+
+    def test_extract_drive_folder_id_rejects_invalid_value(self):
+        with self.assertRaises(ValueError):
+            app.extract_drive_folder_id("https://drive.google.com/drive/u/0/my-drive")
+
     def test_playback_url_uses_site_proxy_and_encodes_source(self):
         result = app.playback_hls_url(
             "https://storage-cf.sangsang.edu.vn/a/master.m3u8", 202

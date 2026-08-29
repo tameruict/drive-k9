@@ -40,6 +40,7 @@ SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 UPLOAD_CHUNK_SIZE = 64 * 1024 * 1024
 URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.I)
 INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+DRIVE_ID = re.compile(r"^[A-Za-z0-9_-]{10,}$")
 
 
 def sanitize_error(error: BaseException | str) -> str:
@@ -55,6 +56,21 @@ def atomic_write_json(path: pathlib.Path, payload: dict[str, Any]) -> None:
 
 def drive_query_literal(value: str) -> str:
     return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
+
+def extract_drive_folder_id(value: str) -> str:
+    """Accept a raw Drive ID or any common Google Drive folder URL."""
+    raw = str(value or "").strip().strip('"\'')
+    if DRIVE_ID.fullmatch(raw):
+        return raw
+    parsed = urlsplit(raw)
+    path_match = re.search(r"/folders/([A-Za-z0-9_-]+)", parsed.path)
+    if path_match and DRIVE_ID.fullmatch(path_match.group(1)):
+        return path_match.group(1)
+    query_id = (parse_qs(parsed.query).get("id") or [""])[0]
+    if DRIVE_ID.fullmatch(query_id):
+        return query_id
+    raise ValueError("dest-folder-id must be a Google Drive folder ID or URL")
 
 
 def safe_filename(title: str, order: int, lesson_id: str = "") -> str:
@@ -530,7 +546,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--course-url", default="")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--token-file", type=pathlib.Path, required=True)
-    parser.add_argument("--dest-folder-id", required=True)
+    parser.add_argument("--dest-folder-id", required=True, help="Google Drive folder ID or full folder URL")
     parser.add_argument("--checkpoint-file", type=pathlib.Path, default=pathlib.Path("sangsang_reupload_checkpoint.json"))
     parser.add_argument("--report-file", type=pathlib.Path, default=pathlib.Path("sangsang_reupload_report.json"))
     parser.add_argument("--max-workers", type=int, default=1)
@@ -547,6 +563,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    dest_folder_id = extract_drive_folder_id(args.dest_folder_id)
     with requests.Session() as session:
         session.headers.update({"User-Agent": "drive-k9-sangsang/1.0"})
         url, resolved_slug = resolve_course_url(args.course_url, args.course_slug, args.base_url)
@@ -559,7 +576,7 @@ def main() -> int:
         course,
         resolved_slug,
         credentials,
-        args.dest_folder_id,
+        dest_folder_id,
         args.checkpoint_file,
         args.report_file,
         args.max_workers,

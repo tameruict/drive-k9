@@ -9,7 +9,7 @@ on:
         type: string
         default: "dgnl-bca"
       dest_folder_id:
-        description: "Destination Google Drive folder ID"
+        description: "Destination Google Drive folder ID or full folder URL"
         required: true
         type: string
       max_workers:

@@ -44,7 +44,8 @@ HLS, dung `ffmpeg` dong goi MP4 va upload resumable vao Drive. Moi video duoc
 luu trong folder nhom tuong ung, co checkpoint va bo qua file da upload.
 
 Chi can repository secret `DRIVE_TOKEN` la OAuth `token.json` co quyen Drive.
-Khong can `DRIVE_COOKIE`. `dest_folder_id` la folder goc trong Drive cua anh.
+Khong can `DRIVE_COOKIE`. `dest_folder_id` nhan ca ID thuan hoac full URL folder
+Drive cua anh.
 
 Chay canary mot bai truoc:
 
