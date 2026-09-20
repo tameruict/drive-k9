@@ -12,7 +12,7 @@ on:
         description: "Destination folder ID"
         required: true
         type: string
-        default: "1jzw1q9Chb9CQRdWXgu0qMP3jmMgmq8As"
+        default: "1O3DFShrB_4XvuaGl1U3C0qJ0QyOuyGvi"
       max_workers:
         description: "Google Drive API workers"
         required: true
