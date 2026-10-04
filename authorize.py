@@ -23,6 +23,13 @@ import json
 import sys
 from pathlib import Path
 
+# Console Windows mặc định cp1252 không in được link kèm chữ tiếng Việt (gây
+# UnicodeEncodeError trong google_auth_oauthlib). Ép UTF-8 cho chắc.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
