@@ -109,8 +109,9 @@ def build_service(token_path: str, label: str):
     if not path.is_file():
         raise SystemExit(f"[{label}] Không tìm thấy token: {token_path}")
     try:
-        creds = Credentials.from_authorized_user_file(str(path), SCOPES)
-    except (ValueError, json.JSONDecodeError) as exc:
+        info = json.loads(path.read_text(encoding="utf-8-sig"))  # utf-8-sig: chịu được BOM
+        creds = Credentials.from_authorized_user_info(info, SCOPES)
+    except (ValueError, json.JSONDecodeError, OSError) as exc:
         raise SystemExit(f"[{label}] Token JSON không hợp lệ: {exc}")
 
     if not creds.valid:
@@ -249,11 +250,11 @@ def find_dest_folder(service, parent_id: str, name: str) -> str | None:
 
 
 def ensure_dest_folder(service, parent_id: str, name: str, dry_run: bool) -> str:
+    if dry_run:
+        return f"(dry-run-folder:{name})"
     existing = find_dest_folder(service, parent_id, name)
     if existing:
         return existing
-    if dry_run:
-        return f"(dry-run-folder:{name})"
     created = with_retry(
         lambda: service.files().create(
             body={"name": name, "mimeType": FOLDER_MIME_TYPE, "parents": [parent_id]},
@@ -280,6 +281,55 @@ def dest_file_exists(service, parent_id: str, name: str) -> str | None:
     )
     files = resp.get("files", [])
     return files[0]["id"] if files else None
+
+
+def get_folder_name(src_service, folder_id: str) -> str:
+    """Lấy tên folder nguồn (qua A). Lỗi -> thông báo A không truy cập được."""
+    try:
+        meta = with_retry(
+            lambda: src_service.files().get(
+                fileId=folder_id, fields="id, name, mimeType",
+                supportsAllDrives=True,
+            ).execute(),
+            what=f"get folder {folder_id}",
+        )
+    except HttpError as exc:
+        raise SystemExit(
+            f"[A] Không truy cập được folder nguồn {folder_id}: {exc}. "
+            "Kiểm tra acc A (.edu) có quyền xem folder này không."
+        )
+    if meta.get("mimeType") != FOLDER_MIME_TYPE:
+        raise SystemExit(f"[A] {folder_id} không phải folder (mimeType={meta.get('mimeType')}).")
+    return str(meta.get("name") or folder_id)
+
+
+def preflight_dest(dst_service, dest_root: str) -> None:
+    """Kiểm tra B truy cập + ghi được vào folder đích trước khi chạy."""
+    try:
+        meta = with_retry(
+            lambda: dst_service.files().get(
+                fileId=dest_root,
+                fields="id, name, mimeType, driveId, ownedByMe, capabilities(canAddChildren)",
+                supportsAllDrives=True,
+            ).execute(),
+            what=f"preflight dest {dest_root}",
+        )
+    except HttpError as exc:
+        raise SystemExit(
+            f"[B] Không truy cập được folder đích {dest_root}: {exc}. "
+            "Hãy share folder đích cho acc B với quyền Editor."
+        )
+    if meta.get("mimeType") != FOLDER_MIME_TYPE:
+        raise SystemExit(f"[B] Đích {dest_root} không phải folder.")
+    if not meta.get("capabilities", {}).get("canAddChildren", False):
+        raise SystemExit(
+            f"[B] Acc B không có quyền ghi vào folder đích '{meta.get('name')}'. "
+            "Hãy cấp quyền Editor cho acc B."
+        )
+    where = "Shared Drive (file sẽ thuộc Shared Drive, KHÔNG tính quota B)" if meta.get("driveId") \
+        else ("B sở hữu" if meta.get("ownedByMe") else "folder người khác sở hữu, B là Editor "
+              "(file B tạo vẫn do B sở hữu, tính quota B)")
+    log(f"[B] Đích OK: '{meta.get('name')}' — {where}.")
 
 
 # --------------------------------------------------------------------------- #
@@ -470,7 +520,8 @@ def main() -> int:
     parser.add_argument("--dest-token", default="token_B.json",
                         help="Token JSON của acc B (kho lưu, sẽ sở hữu file).")
     parser.add_argument("--source-folder-id", required=True,
-                        help="ID hoặc URL folder nguồn trên Drive A.")
+                        help="ID/URL folder nguồn trên Drive A. Nhiều folder ngăn bằng dấu phẩy; "
+                             "mỗi nguồn thành 1 subfolder cùng tên trong folder đích.")
     parser.add_argument("--dest-folder-id", required=True,
                         help="ID hoặc URL folder đích trên Drive B.")
     parser.add_argument("--workers", type=int, default=4,
@@ -486,28 +537,38 @@ def main() -> int:
                         help="Chỉ liệt kê, không tải/ghi gì.")
     args = parser.parse_args()
 
-    src_folder = extract_drive_id(args.source_folder_id)
-    dest_folder = extract_drive_id(args.dest_folder_id)
+    source_ids = parse_folder_list(args.source_folder_id)
+    dest_root = extract_drive_id(args.dest_folder_id)
     workers = max(1, min(args.workers, 16))
 
     temp_root = args.temp_dir or os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()
     temp_dir = Path(tempfile.mkdtemp(prefix="xacc_", dir=temp_root))
 
     log("Cross-account Drive sync · A đọc nguồn → đĩa tạm → B upload (B sở hữu)")
-    log(f"Nguồn (A): {src_folder}  →  Đích (B): {dest_folder}")
+    log(f"Nguồn (A): {len(source_ids)} folder  →  Đích (B): {dest_root}")
     log(f"Workers: {workers} · Temp: {temp_dir} · Dry-run: {args.dry_run}")
 
     src_service, _ = build_service(args.source_token, "A/nguồn")
     dst_service, _ = build_service(args.dest_token, "B/đích")
 
+    preflight_dest(dst_service, dest_root)
+
     cp = Checkpoint.load(Path(args.checkpoint))
     stats = Stats()
 
-    log("Đang duyệt cây thư mục nguồn...")
-    tasks = walk_and_collect(
-        src_service, dst_service, cp, src_folder, dest_folder,
-        recursive=not args.no_recursive, dry_run=args.dry_run,
-    )
+    tasks: list[FileTask] = []
+    for src_id in source_ids:
+        name = get_folder_name(src_service, src_id)
+        sub_dest = cp.folders.get(src_id) or ensure_dest_folder(
+            dst_service, dest_root, name, args.dry_run
+        )
+        cp.set_folder(src_id, sub_dest)
+        cp.save()
+        log(f"Nguồn '{name}' ({src_id}) → subfolder đích {sub_dest}")
+        tasks.extend(walk_and_collect(
+            src_service, dst_service, cp, src_id, sub_dest,
+            recursive=not args.no_recursive, dry_run=args.dry_run,
+        ))
     pending = [t for t in tasks if t.src_id not in cp.files]
     log(f"Tổng {len(tasks)} file, {len(pending)} file cần xử lý "
         f"({len(tasks) - len(pending)} đã có trong checkpoint).")
@@ -552,6 +613,23 @@ def extract_drive_id(value: str) -> str:
     if "/" in text or "://" in text:
         raise SystemExit(f"Không tách được Drive id từ: {value!r}")
     return text
+
+
+def parse_folder_list(raw: str) -> list[str]:
+    """Tách danh sách URL/id ngăn bằng dấu phẩy thành các folder id (bỏ trùng)."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for chunk in str(raw).split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        folder_id = extract_drive_id(chunk)
+        if folder_id not in seen:
+            seen.add(folder_id)
+            ids.append(folder_id)
+    if not ids:
+        raise SystemExit("Không có folder nguồn nào trong --source-folder-id.")
+    return ids
 
 
 if __name__ == "__main__":

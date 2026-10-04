@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       source_folder_id:
-        description: "Folder nguồn trên Drive A (ID hoặc URL)"
+        description: "Folder nguồn trên Drive A (ID/URL; nhiều folder ngăn bằng dấu phẩy)"
         required: true
         type: string
       dest_folder_id:
