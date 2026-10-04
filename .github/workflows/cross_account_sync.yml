@@ -58,13 +58,16 @@ jobs:
             google-auth-httplib2==0.2.0 \
             google-auth-oauthlib==1.2.0
 
+      # Cache key không được chứa dấu phẩy (source_folder_id có thể nhiều nguồn),
+      # nên dùng run_id + restore-keys chung. Checkpoint khoá theo file id nên
+      # dùng lại giữa các run là an toàn.
       - name: Restore checkpoint
         uses: actions/cache@v4
         with:
           path: cross_account_checkpoint.json
-          key: cross-account-sync-${{ inputs.source_folder_id }}-${{ github.run_id }}
+          key: cross-account-sync-${{ github.run_id }}
           restore-keys: |
-            cross-account-sync-${{ inputs.source_folder_id }}-
+            cross-account-sync-
 
       - name: Write tokens
         env:
