@@ -16,6 +16,8 @@ env/
 credentials.json
 token.json
 token-*.json
+token_*.json
+cross_account_checkpoint.json
 cookie.txt
 cookies.txt
 *.cookies.txt

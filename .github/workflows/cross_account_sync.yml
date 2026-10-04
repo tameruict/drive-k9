@@ -1,0 +1,101 @@
+name: Cross-Account Drive Sync
+
+# A (token A) đọc folder nguồn -> tải xuống đĩa runner -> B (token B) upload,
+# B là chủ sở hữu. A không tốn quota Drive. Không cần transfer ownership.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_folder_id:
+        description: "Folder nguồn trên Drive A (ID hoặc URL)"
+        required: true
+        type: string
+      dest_folder_id:
+        description: "Folder đích trên Drive B (ID hoặc URL)"
+        required: true
+        type: string
+      max_workers:
+        description: "Số file song song"
+        required: true
+        type: choice
+        options: ["2", "4", "6", "8"]
+        default: "4"
+      dry_run:
+        description: "Chạy thử (chỉ liệt kê, không ghi)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Chạy tuần tự để không đụng quota/đụng checkpoint.
+concurrency:
+  group: cross-account-drive-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            google-api-python-client==2.131.0 \
+            google-auth==2.29.0 \
+            google-auth-httplib2==0.2.0 \
+            google-auth-oauthlib==1.2.0
+
+      - name: Restore checkpoint
+        uses: actions/cache@v4
+        with:
+          path: cross_account_checkpoint.json
+          key: cross-account-sync-${{ inputs.source_folder_id }}-${{ github.run_id }}
+          restore-keys: |
+            cross-account-sync-${{ inputs.source_folder_id }}-
+
+      - name: Write tokens
+        env:
+          TOKEN_A: ${{ secrets.TOKEN_A }}
+          TOKEN_B: ${{ secrets.TOKEN_B }}
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          a = os.environ.get("TOKEN_A", "")
+          b = os.environ.get("TOKEN_B", "")
+          if not a:
+              raise SystemExit("Thiếu Actions secret: TOKEN_A")
+          if not b:
+              raise SystemExit("Thiếu Actions secret: TOKEN_B")
+          json.loads(a); json.loads(b)  # xác nhận JSON hợp lệ
+          tmp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          (tmp / "token_A.json").write_text(a, encoding="utf-8")
+          (tmp / "token_B.json").write_text(b, encoding="utf-8")
+          print("Tokens restored.")
+          PY
+
+      - name: Run cross-account sync
+        run: |
+          python -u cross_account_sync.py \
+            --source-token "$RUNNER_TEMP/token_A.json" \
+            --dest-token "$RUNNER_TEMP/token_B.json" \
+            --source-folder-id "${{ inputs.source_folder_id }}" \
+            --dest-folder-id "${{ inputs.dest_folder_id }}" \
+            --workers "${{ inputs.max_workers }}" \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      - name: Remove tokens
+        if: always()
+        run: rm -f "$RUNNER_TEMP/token_A.json" "$RUNNER_TEMP/token_B.json"
