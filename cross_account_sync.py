@@ -103,38 +103,51 @@ def log(message: str) -> None:
 # --------------------------------------------------------------------------- #
 # Auth
 # --------------------------------------------------------------------------- #
-def build_service(token_path: str, label: str):
-    """Tạo Drive service từ token.json (tự refresh nếu hết hạn)."""
-    path = Path(token_path)
-    if not path.is_file():
-        raise SystemExit(f"[{label}] Không tìm thấy token: {token_path}")
-    try:
-        info = json.loads(path.read_text(encoding="utf-8-sig"))  # utf-8-sig: chịu được BOM
-        creds = Credentials.from_authorized_user_info(info, SCOPES)
-    except (ValueError, json.JSONDecodeError, OSError) as exc:
-        raise SystemExit(f"[{label}] Token JSON không hợp lệ: {exc}")
+class DriveClient:
+    """Drive client an toàn đa luồng.
 
-    if not creds.valid:
-        if creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception as exc:  # noqa: BLE001
-                raise SystemExit(
-                    f"[{label}] Refresh token thất bại (hãy chạy authorize.py lại): {exc}"
-                )
-            try:
-                path.write_text(creds.to_json(), encoding="utf-8")
-            except OSError:
-                pass  # token mới vẫn dùng được trong phiên này dù không ghi lại được
-        else:
+    googleapiclient/httplib2 KHÔNG thread-safe: dùng chung 1 service cho nhiều
+    luồng gây race trên socket/SSL → core dump ("futex ... unexpected error").
+    Lớp này cấp cho mỗi luồng 1 Credentials + 1 service RIÊNG (thread-local),
+    dựng từ cùng token info.
+    """
+
+    def __init__(self, token_path: str, label: str):
+        path = Path(token_path)
+        if not path.is_file():
+            raise SystemExit(f"[{label}] Không tìm thấy token: {token_path}")
+        try:
+            # utf-8-sig: chịu được BOM
+            self._info = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (ValueError, json.JSONDecodeError, OSError) as exc:
+            raise SystemExit(f"[{label}] Token JSON không hợp lệ: {exc}")
+        if "refresh_token" not in self._info:
             raise SystemExit(
-                f"[{label}] Token không hợp lệ và không có refresh_token. Chạy authorize.py lại."
+                f"[{label}] Token thiếu refresh_token. Chạy authorize.py lại."
             )
+        self.label = label
+        self._local = threading.local()
+        # Dựng 1 lần ở luồng chính để xác thực + lấy email.
+        self.email = account_email(self.service())
+        log(f"[{label}] Đăng nhập: {self.email or '(không đọc được email)'}")
 
-    service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    email = account_email(service)
-    log(f"[{label}] Đăng nhập: {email or '(không đọc được email)'}")
-    return service, email
+    def service(self):
+        """Trả về Drive service của luồng hiện tại (tạo mới nếu chưa có)."""
+        svc = getattr(self._local, "svc", None)
+        if svc is not None:
+            return svc
+        try:
+            creds = Credentials.from_authorized_user_info(self._info, SCOPES)
+            if not creds.valid and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+        except Exception as exc:  # noqa: BLE001
+            raise SystemExit(
+                f"[{self.label}] Khởi tạo/refresh token thất bại "
+                f"(hãy chạy authorize.py lại): {exc}"
+            )
+        svc = build("drive", "v3", credentials=creds, cache_discovery=False)
+        self._local.svc = svc
+        return svc
 
 
 def account_email(service) -> str:
@@ -407,8 +420,9 @@ class Stats:
             setattr(self, key, getattr(self, key) + 1)
 
 
-def process_file(task: FileTask, src_service, dst_service, cp: Checkpoint,
-                 stats: Stats, temp_dir: Path, dry_run: bool, verify_dup: bool) -> None:
+def process_file(task: FileTask, src_client: "DriveClient", dst_client: "DriveClient",
+                 cp: Checkpoint, stats: Stats, temp_dir: Path,
+                 dry_run: bool, verify_dup: bool) -> None:
     if task.src_id in cp.files:
         stats.bump("skipped")
         return
@@ -417,6 +431,10 @@ def process_file(task: FileTask, src_service, dst_service, cp: Checkpoint,
         log(f"  [dry-run] sẽ copy: {task.rel_path}")
         stats.bump("copied")
         return
+
+    # Service riêng cho luồng này (không chia sẻ transport giữa các luồng).
+    src_service = src_client.service()
+    dst_service = dst_client.service()
 
     if verify_dup:
         existing = dest_file_exists(dst_service, task.dest_parent, task.name)
@@ -533,6 +551,8 @@ def main() -> int:
                         help="Chỉ copy tầng trên cùng, không vào folder con.")
     parser.add_argument("--no-verify-dup", action="store_true",
                         help="Bỏ bước kiểm tra trùng tên ở đích (nhanh hơn, dựa hoàn toàn vào checkpoint).")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="Chỉ xử lý tối đa N file (0 = không giới hạn). Dùng để chạy canary.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Chỉ liệt kê, không tải/ghi gì.")
     args = parser.parse_args()
@@ -548,35 +568,38 @@ def main() -> int:
     log(f"Nguồn (A): {len(source_ids)} folder  →  Đích (B): {dest_root}")
     log(f"Workers: {workers} · Temp: {temp_dir} · Dry-run: {args.dry_run}")
 
-    src_service, _ = build_service(args.source_token, "A/nguồn")
-    dst_service, _ = build_service(args.dest_token, "B/đích")
+    src_client = DriveClient(args.source_token, "A/nguồn")
+    dst_client = DriveClient(args.dest_token, "B/đích")
 
-    preflight_dest(dst_service, dest_root)
+    preflight_dest(dst_client.service(), dest_root)
 
     cp = Checkpoint.load(Path(args.checkpoint))
     stats = Stats()
 
     tasks: list[FileTask] = []
     for src_id in source_ids:
-        name = get_folder_name(src_service, src_id)
+        name = get_folder_name(src_client.service(), src_id)
         sub_dest = cp.folders.get(src_id) or ensure_dest_folder(
-            dst_service, dest_root, name, args.dry_run
+            dst_client.service(), dest_root, name, args.dry_run
         )
         cp.set_folder(src_id, sub_dest)
         cp.save()
         log(f"Nguồn '{name}' ({src_id}) → subfolder đích {sub_dest}")
         tasks.extend(walk_and_collect(
-            src_service, dst_service, cp, src_id, sub_dest,
+            src_client.service(), dst_client.service(), cp, src_id, sub_dest,
             recursive=not args.no_recursive, dry_run=args.dry_run,
         ))
     pending = [t for t in tasks if t.src_id not in cp.files]
+    if args.limit and len(pending) > args.limit:
+        log(f"--limit {args.limit}: chỉ xử lý {args.limit}/{len(pending)} file (canary).")
+        pending = pending[:args.limit]
     log(f"Tổng {len(tasks)} file, {len(pending)} file cần xử lý "
         f"({len(tasks) - len(pending)} đã có trong checkpoint).")
 
     verify_dup = not args.no_verify_dup
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
-            pool.submit(process_file, task, src_service, dst_service, cp,
+            pool.submit(process_file, task, src_client, dst_client, cp,
                         stats, temp_dir, args.dry_run, verify_dup)
             for task in pending
         ]
