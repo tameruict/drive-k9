@@ -29,9 +29,12 @@ Ví dụ
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
+import socket
+import ssl
 import sys
 import tempfile
 import threading
@@ -46,8 +49,10 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import httplib2
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
@@ -61,6 +66,7 @@ from drive_common import (
     drive_query_literal,
     is_retryable_drive_error,
     shortcut_target_id,
+    shortcut_target_mime_type,
 )
 
 # Full Drive scope: A cần đọc/tải, B cần ghi/tạo file.
@@ -90,6 +96,20 @@ EXPORT_MAP = {
 DOWNLOAD_CHUNK = 64 * 1024 * 1024  # 64MB mỗi lần đọc
 UPLOAD_CHUNK = 64 * 1024 * 1024
 MAX_RETRIES = 5
+# Timeout cho mỗi thao tác HTTP. Không có nó, một socket bị stall (mạng chập
+# chờn, runner Actions) sẽ treo next_chunk() vĩnh viễn và cả job đứng im.
+HTTP_TIMEOUT = 300  # giây
+# Lỗi mạng tạm thời: httplib2/socket ném ra ngoài HttpError nên with_retry phải
+# bắt riêng, nếu không file lẻ sẽ fail hoặc luồng chính crash khi đang list.
+RETRYABLE_NET_ERRORS = (
+    socket.timeout,
+    TimeoutError,
+    ConnectionError,
+    ssl.SSLError,
+    http.client.IncompleteRead,
+    http.client.RemoteDisconnected,
+    BrokenPipeError,
+)
 LIST_FIELDS = (
     "nextPageToken, files(id, name, mimeType, size, "
     "shortcutDetails(targetId, targetMimeType))"
@@ -145,7 +165,9 @@ class DriveClient:
                 f"[{self.label}] Khởi tạo/refresh token thất bại "
                 f"(hãy chạy authorize.py lại): {exc}"
             )
-        svc = build("drive", "v3", credentials=creds, cache_discovery=False)
+        # http riêng mỗi luồng (httplib2 không thread-safe) + timeout chống treo.
+        authed_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=HTTP_TIMEOUT))
+        svc = build("drive", "v3", http=authed_http, cache_discovery=False)
         self._local.svc = svc
         return svc
 
@@ -174,6 +196,14 @@ def with_retry(func, *, what: str):
                 delay = min(delay * 2, 60)
                 continue
             raise
+        except RETRYABLE_NET_ERRORS as exc:
+            if attempt < MAX_RETRIES:
+                log(f"  ! {what}: lỗi mạng ({exc!r}). Thử lại sau {delay:.0f}s "
+                    f"({attempt}/{MAX_RETRIES}).")
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+            raise
 
 
 # --------------------------------------------------------------------------- #
@@ -182,8 +212,9 @@ def with_retry(func, *, what: str):
 @dataclass
 class Checkpoint:
     path: Path
-    folders: dict = field(default_factory=dict)  # src_folder_id -> dest_folder_id
-    files: dict = field(default_factory=dict)     # src_file_id  -> dest_file_id
+    folders: dict = field(default_factory=dict)  # src_folder_id   -> dest_folder_id
+    files: dict = field(default_factory=dict)     # src_file_id     -> dest_file_id
+    shortcuts: dict = field(default_factory=dict)  # src_shortcut_id -> dest_shortcut_id
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @classmethod
@@ -194,7 +225,9 @@ class Checkpoint:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 cp.folders = dict(data.get("folders", {}))
                 cp.files = dict(data.get("files", {}))
-                log(f"Checkpoint: {len(cp.folders)} folder, {len(cp.files)} file đã có.")
+                cp.shortcuts = dict(data.get("shortcuts", {}))
+                log(f"Checkpoint: {len(cp.folders)} folder, {len(cp.files)} file, "
+                    f"{len(cp.shortcuts)} shortcut đã có.")
             except (OSError, json.JSONDecodeError):
                 log("Checkpoint hỏng hoặc trống — bắt đầu mới.")
         return cp
@@ -203,7 +236,8 @@ class Checkpoint:
         with self._lock:
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
             tmp.write_text(
-                json.dumps({"folders": self.folders, "files": self.files},
+                json.dumps({"folders": self.folders, "files": self.files,
+                            "shortcuts": self.shortcuts},
                            ensure_ascii=False, indent=0),
                 encoding="utf-8",
             )
@@ -216,6 +250,10 @@ class Checkpoint:
     def set_file(self, src: str, dest: str) -> None:
         with self._lock:
             self.files[src] = dest
+
+    def set_shortcut(self, src: str, dest: str) -> None:
+        with self._lock:
+            self.shortcuts[src] = dest
 
 
 # --------------------------------------------------------------------------- #
@@ -358,6 +396,21 @@ class FileTask:
     rel_path: str
 
 
+@dataclass
+class ShortcutTask:
+    """Một shortcut ở nguồn cần tái tạo thành shortcut ở đích.
+
+    Không deref thành bản copy: đích phải là shortcut y như nguồn, trỏ tới bản
+    copy tương ứng của target (tra qua checkpoint sau khi copy xong nội dung).
+    """
+    src_id: str
+    name: str
+    target_id: str
+    target_mime: str
+    dest_parent: str
+    rel_path: str
+
+
 def download_file(src_service, task: FileTask, temp_dir: Path) -> tuple[Path, str]:
     """Tải file từ A xuống đĩa tạm. Trả về (đường dẫn, tên file cuối cùng)."""
     export = EXPORT_MAP.get(task.mime_type)
@@ -405,7 +458,31 @@ def upload_file(dst_service, tmp_path: Path, final_name: str, dest_parent: str) 
                 time.sleep(min(2 ** attempt, 60))
                 continue
             raise
+        except RETRYABLE_NET_ERRORS:
+            attempt += 1
+            if attempt < MAX_RETRIES:
+                time.sleep(min(2 ** attempt, 60))
+                continue
+            raise
     return response["id"]
+
+
+def create_shortcut(dst_service, name: str, dest_target_id: str,
+                    dest_parent: str) -> str:
+    """Tạo shortcut ở đích trỏ tới file/folder đã copy (dest_target_id)."""
+    body = {
+        "name": name,
+        "mimeType": SHORTCUT_MIME_TYPE,
+        "parents": [dest_parent],
+        "shortcutDetails": {"targetId": dest_target_id},
+    }
+    created = with_retry(
+        lambda: dst_service.files().create(
+            body=body, fields="id", supportsAllDrives=True,
+        ).execute(),
+        what=f"create shortcut {name}",
+    )
+    return created["id"]
 
 
 class Stats:
@@ -414,6 +491,8 @@ class Stats:
         self.copied = 0
         self.skipped = 0
         self.failed = 0
+        self.shortcuts = 0
+        self.shortcut_unresolved = 0
 
     def bump(self, key: str) -> None:
         with self.lock:
@@ -470,8 +549,14 @@ def process_file(task: FileTask, src_client: "DriveClient", dst_client: "DriveCl
 # --------------------------------------------------------------------------- #
 def walk_and_collect(src_service, dst_service, cp: Checkpoint,
                      src_folder: str, dest_folder: str, recursive: bool,
-                     dry_run: bool) -> list[FileTask]:
-    """Duyệt cây nguồn, tạo folder đích tương ứng, trả về danh sách file cần copy."""
+                     dry_run: bool, visited: set[str],
+                     shortcuts: list[ShortcutTask]) -> list[FileTask]:
+    """Duyệt cây nguồn, tạo folder đích tương ứng, trả về danh sách file cần copy.
+
+    Shortcut KHÔNG bị deref: ghi vào `shortcuts` để tái tạo thành shortcut ở đích
+    (pass 2). `visited` chặn duyệt lại cùng một folder nguồn — tránh loop vô hạn
+    khi có shortcut trỏ vòng, và tránh copy lặp khi nhiều lối dẫn về một folder.
+    """
     tasks: list[FileTask] = []
     # (src_folder_id, dest_folder_id, rel_path)
     stack = [(src_folder, dest_folder, "")]
@@ -479,6 +564,9 @@ def walk_and_collect(src_service, dst_service, cp: Checkpoint,
 
     while stack:
         src_id, dst_id, rel = stack.pop()
+        if src_id in visited:
+            continue
+        visited.add(src_id)
         children = list_children(src_service, src_id)
         for item in children:
             name = item.get("name", "")
@@ -489,23 +577,14 @@ def walk_and_collect(src_service, dst_service, cp: Checkpoint,
             if mime == SHORTCUT_MIME_TYPE:
                 target_id = shortcut_target_id(item)
                 if not target_id:
+                    log(f"  (bỏ qua shortcut không có target: {child_rel})")
                     continue
-                try:
-                    target = with_retry(
-                        lambda: src_service.files().get(
-                            fileId=target_id,
-                            fields="id, name, mimeType, size",
-                            supportsAllDrives=True,
-                        ).execute(),
-                        what=f"resolve shortcut {name}",
-                    )
-                except HttpError:
-                    log(f"  (bỏ qua shortcut hỏng: {child_rel})")
-                    continue
-                item_id = target["id"]
-                mime = target.get("mimeType", "")
-                name = target.get("name", name)
-                item = target
+                shortcuts.append(ShortcutTask(
+                    src_id=item_id, name=name, target_id=target_id,
+                    target_mime=shortcut_target_mime_type(item),
+                    dest_parent=dst_id, rel_path=child_rel,
+                ))
+                continue
 
             if mime == FOLDER_MIME_TYPE:
                 if not recursive:
@@ -527,6 +606,39 @@ def walk_and_collect(src_service, dst_service, cp: Checkpoint,
                 dest_parent=dst_id, rel_path=child_rel,
             ))
     return tasks
+
+
+def process_shortcuts(shortcuts: list[ShortcutTask], dst_client: "DriveClient",
+                      cp: Checkpoint, stats: Stats, dry_run: bool) -> None:
+    """Pass 2: tái tạo shortcut ở đích sau khi nội dung thật đã copy xong.
+
+    Target của shortcut được tra trong checkpoint (folders/files src→dest). Nếu
+    target chưa nằm trong phạm vi copy thì không có id đích để trỏ tới — báo và
+    bỏ qua thay vì tạo shortcut gãy.
+    """
+    for st in shortcuts:
+        if st.src_id in cp.shortcuts:
+            stats.bump("skipped")
+            continue
+        dest_target = cp.folders.get(st.target_id) or cp.files.get(st.target_id)
+        if not dest_target:
+            log(f"  (shortcut '{st.rel_path}': target chưa được copy vào đích — bỏ qua)")
+            stats.bump("shortcut_unresolved")
+            continue
+        if dry_run:
+            log(f"  [dry-run] sẽ tạo shortcut: {st.rel_path} → {dest_target}")
+            stats.bump("shortcuts")
+            continue
+        try:
+            sid = create_shortcut(dst_client.service(), st.name, dest_target,
+                                  st.dest_parent)
+            cp.set_shortcut(st.src_id, sid)
+            cp.save()
+            log(f"  ↪ shortcut {st.rel_path} → {dest_target}")
+            stats.bump("shortcuts")
+        except Exception as exc:  # noqa: BLE001
+            log(f"  ✗ LỖI shortcut {st.rel_path}: {exc}")
+            stats.bump("failed")
 
 
 def main() -> int:
@@ -577,6 +689,8 @@ def main() -> int:
     stats = Stats()
 
     tasks: list[FileTask] = []
+    shortcuts: list[ShortcutTask] = []
+    visited: set[str] = set()  # dùng chung mọi root: chống loop + copy lặp
     for src_id in source_ids:
         name = get_folder_name(src_client.service(), src_id)
         sub_dest = cp.folders.get(src_id) or ensure_dest_folder(
@@ -588,13 +702,15 @@ def main() -> int:
         tasks.extend(walk_and_collect(
             src_client.service(), dst_client.service(), cp, src_id, sub_dest,
             recursive=not args.no_recursive, dry_run=args.dry_run,
+            visited=visited, shortcuts=shortcuts,
         ))
     pending = [t for t in tasks if t.src_id not in cp.files]
     if args.limit and len(pending) > args.limit:
         log(f"--limit {args.limit}: chỉ xử lý {args.limit}/{len(pending)} file (canary).")
         pending = pending[:args.limit]
     log(f"Tổng {len(tasks)} file, {len(pending)} file cần xử lý "
-        f"({len(tasks) - len(pending)} đã có trong checkpoint).")
+        f"({len(tasks) - len(pending)} đã có trong checkpoint). "
+        f"{len(shortcuts)} shortcut sẽ tái tạo.")
 
     verify_dup = not args.no_verify_dup
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -606,6 +722,13 @@ def main() -> int:
         for _ in as_completed(futures):
             pass
 
+    # Pass 2: tái tạo shortcut sau khi nội dung thật đã có mặt ở đích (để tra
+    # được id đích của target). Shortcut tới folder/file chỉ copy một luồng vì
+    # thường ít và chỉ là thao tác tạo metadata.
+    if shortcuts:
+        log(f"Tái tạo {len(shortcuts)} shortcut...")
+        process_shortcuts(shortcuts, dst_client, cp, stats, args.dry_run)
+
     cp.save()
     try:
         temp_dir.rmdir()
@@ -613,7 +736,9 @@ def main() -> int:
         pass
 
     log("")
-    log(f"Hoàn tất: {stats.copied} copy · {stats.skipped} bỏ qua · {stats.failed} lỗi.")
+    log(f"Hoàn tất: {stats.copied} copy · {stats.skipped} bỏ qua · "
+        f"{stats.shortcuts} shortcut · {stats.shortcut_unresolved} shortcut chưa khớp target · "
+        f"{stats.failed} lỗi.")
     return 1 if stats.failed else 0
 
 
