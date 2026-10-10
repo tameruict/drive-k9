@@ -99,7 +99,11 @@ DEFAULT_USER_AGENT = (
 )
 DEFAULT_CHUNK_SIZE = 1024 * 1024
 DRIVE_UC_URL = "https://drive.google.com/uc"
-DRIVE_VIDEO_INFO_URL = "https://drive.google.com/get_video_info"
+# drive.google.com/get_video_info đã bị Google gỡ (404 cho mọi file). Trình phát
+# Drive hiện lấy luồng qua API này, xác thực bằng cookie + SAPISIDHASH.
+DRIVE_WEB_ORIGIN = "https://drive.google.com"
+DRIVE_PLAYBACK_URL = "https://workspacevideo-pa.clients6.google.com/v1/drive/media/{file_id}/playback"
+DRIVE_PLAYBACK_API_KEY = "AIzaSyDVQw45DwoYh632gvsP5vPDqEKvb-Ywnb8"  # key công khai của Drive web
 GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
 GOOGLE_SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 GOOGLE_APPS_MIME_PREFIX = "application/vnd.google-apps."
@@ -126,7 +130,6 @@ COOKIE_AUTH_ERROR_KEYWORDS = (
     "sign in",
     "servicelogin",
     "accounts.google",
-    "while reading video stream metadata",
     "check that the cookie has access",
 )
 
@@ -247,6 +250,14 @@ class TokenAuth(requests.auth.AuthBase):
 
 class DownloadError(RuntimeError):
     pass
+
+
+class DrivePlaybackError(DownloadError):
+    """API playback từ chối mọi authuser; `status_codes` để caller phân loại lỗi."""
+
+    def __init__(self, message: str, status_codes: list[int]):
+        super().__init__(message)
+        self.status_codes = status_codes
 
 
 class CookieRefreshState:
@@ -1000,28 +1011,12 @@ def open_drive_video_stream_response(
     file_id: str,
     headers: dict[str, str],
 ) -> requests.Response:
-    info_response = session.get(
-        DRIVE_VIDEO_INFO_URL,
-        params={"docid": file_id, "authuser": "0"},
+    streams = fetch_drive_playback_streams(
+        session,
+        file_id,
         timeout=args.timeout,
         verify=not args.insecure,
     )
-    if info_response.status_code >= 400:
-        raise DownloadError(
-            f"HTTP {info_response.status_code} while reading video stream metadata"
-        )
-
-    info = parse_qs(info_response.text, keep_blank_values=True)
-    status = first_value(info, "status")
-    if status and status.lower() != "ok":
-        reason = first_value(info, "reason") or "Google Drive did not return video streams"
-        raise DownloadError(f"Video stream fallback failed: {reason}")
-
-    streams = parse_video_streams(info)
-    if not streams:
-        reason = first_value(info, "reason") or "No video stream URL found"
-        raise DownloadError(f"Video stream fallback failed: {reason}")
-
     stream = choose_video_stream(streams)
     stream_headers = dict(headers)
     stream_headers.setdefault("Referer", f"https://drive.google.com/file/d/{file_id}/preview")
@@ -1068,60 +1063,96 @@ def should_try_video_stream_fallback(
     return looks_like_drive_block and (is_video or has_video_extension or unknown_type)
 
 
-def parse_video_streams(info: dict[str, list[str]]) -> list[VideoStream]:
-    streams: list[VideoStream] = []
+def sapisid_authorization(session: requests.Session) -> Optional[str]:
+    """Header Authorization mà Drive web gửi cho các API *.clients6.google.com.
 
-    for stream_map_name in ("fmt_stream_map", "url_encoded_fmt_stream_map"):
-        stream_map = first_value(info, stream_map_name)
-        if not stream_map:
-            continue
-        streams.extend(parse_stream_map(stream_map, stream_map_name))
+    Thiếu header này, API playback chỉ thấy phiên ẩn danh và trả
+    "permission denied on media item" dù cookie còn sống.
+    """
+    values = {cookie.name: cookie.value for cookie in session.cookies}
+    sapisid = (
+        values.get("SAPISID")
+        or values.get("__Secure-3PAPISID")
+        or values.get("__Secure-1PAPISID")
+    )
+    if not sapisid:
+        return None
+    timestamp = int(time.time())
+    digest = hashlib.sha1(f"{timestamp} {sapisid} {DRIVE_WEB_ORIGIN}".encode()).hexdigest()
+    return f"SAPISIDHASH {timestamp}_{digest} SAPISID1PHASH {timestamp}_{digest}"
 
-    unique: dict[str, VideoStream] = {}
-    for stream in streams:
-        if stream.url and stream.url not in unique:
-            unique[stream.url] = stream
-    return list(unique.values())
 
+def fetch_drive_playback_streams(
+    session: requests.Session,
+    file_id: str,
+    *,
+    resource_key: Optional[str] = None,
+    timeout: float = 30,
+    verify: bool = True,
+) -> list[VideoStream]:
+    """Lấy các luồng MP4 của video Drive qua API playback của trình phát Drive.
 
-def parse_stream_map(stream_map: str, stream_map_name: str) -> list[VideoStream]:
-    streams: list[VideoStream] = []
-    for entry in split_stream_map(stream_map):
-        if not entry:
-            continue
+    Thử lần lượt authuser 0-3 vì tài khoản có quyền xem có thể không phải số 0.
+    Chỉ trả progressiveTranscodes (MP4 đủ hình + tiếng); adaptiveTranscodes tách
+    riêng video/audio. URL luồng gắn với User-Agent của session: tải nó bằng
+    client khác UA sẽ bị 403.
+    """
+    auth = sapisid_authorization(session)
+    if not auth:
+        raise DownloadError("Cookie thiếu SAPISID — không xác thực được với API playback của Drive.")
 
-        if stream_map_name == "fmt_stream_map" and "|" in entry:
-            itag, url = entry.split("|", 1)
-            streams.append(VideoStream(itag=itag.strip(), url=clean_stream_url(url)))
-            continue
+    headers = {
+        "Authorization": auth,
+        "Origin": DRIVE_WEB_ORIGIN,
+        "Referer": f"{DRIVE_WEB_ORIGIN}/",
+        "Accept": "application/json",
+    }
+    if resource_key:
+        headers["X-Goog-Drive-Resource-Keys"] = f"{file_id}/{resource_key}"
 
-        data = parse_qs(entry, keep_blank_values=True)
-        url = first_value(data, "url")
-        if not url:
-            continue
-        streams.append(
-            VideoStream(
-                itag=first_value(data, "itag"),
-                url=clean_stream_url(url),
-                quality=first_value(data, "quality"),
-            )
+    info: Optional[dict] = None
+    failures: list[str] = []
+    status_codes: list[int] = []
+    for authuser in ("0", "1", "2", "3"):
+        response = session.get(
+            DRIVE_PLAYBACK_URL.format(file_id=file_id),
+            params={"key": DRIVE_PLAYBACK_API_KEY},
+            headers={**headers, "X-Goog-AuthUser": authuser},
+            timeout=timeout,
+            verify=verify,
+        )
+        try:
+            if response.status_code == 200:
+                info = response.json()
+                break
+            try:
+                message = response.json().get("error", {}).get("message", "")
+            except ValueError:
+                message = ""
+            status_codes.append(response.status_code)
+            failures.append(f"authuser={authuser}: HTTP {response.status_code} {message}".strip())
+            if response.status_code not in (401, 403, 404):
+                break
+        finally:
+            response.close()
+    if info is None:
+        raise DrivePlaybackError(
+            f"Không lấy được luồng video ({'; '.join(failures)})", status_codes
         )
 
+    transcodes = (
+        info.get("mediaStreamingData", {})
+        .get("formatStreamingData", {})
+        .get("progressiveTranscodes", [])
+    )
+    streams = [
+        VideoStream(itag=str(item.get("itag", "")), url=item["url"])
+        for item in transcodes
+        if item.get("url")
+    ]
+    if not streams:
+        raise DownloadError("Không tìm thấy luồng video MP4 (progressiveTranscodes rỗng).")
     return streams
-
-
-def split_stream_map(stream_map: str) -> list[str]:
-    entries: list[str] = []
-    current: list[str] = []
-    for char in stream_map:
-        if char == "," and current and current[-1] != "\\":
-            entries.append("".join(current))
-            current = []
-            continue
-        current.append(char)
-    if current:
-        entries.append("".join(current))
-    return entries
 
 
 def choose_video_stream(streams: list[VideoStream]) -> VideoStream:
@@ -1148,21 +1179,6 @@ def quality_rank(quality: str) -> int:
         "tiny": 1,
     }
     return ranks.get(quality.lower(), 0)
-
-
-def first_value(values: dict[str, list[str]], key: str) -> str:
-    items = values.get(key)
-    if not items:
-        return ""
-    return items[0]
-
-
-def clean_stream_url(url: str) -> str:
-    return (
-        html_module.unescape(url.strip())
-        .replace("\\u0026", "&")
-        .replace("\\/", "/")
-    )
 
 
 def validate_file_response(
