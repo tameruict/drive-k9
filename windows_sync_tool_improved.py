@@ -631,6 +631,12 @@ HTTP_RANGE_BUFFER_SIZE = 32 * 1024 * 1024   # 32MB để progress cập nhật n
 UPLOAD_CHUNK_SIZE      = 256 * 1024 * 1024 # 256MB tối đa hoá tốc độ upload
 STREAM_URL_TTL_SECONDS = 3000              # stream URL sống ~50 phút (thực tế ~60 phút)
 
+# drive.google.com/get_video_info đã bị Google gỡ (404 cho mọi file). Trình phát
+# Drive hiện lấy luồng qua API này, xác thực bằng cookie + SAPISIDHASH.
+DRIVE_WEB_ORIGIN       = "https://drive.google.com"
+DRIVE_PLAYBACK_URL     = "https://workspacevideo-pa.clients6.google.com/v1/drive/media/{file_id}/playback"
+DRIVE_PLAYBACK_API_KEY = "AIzaSyDVQw45DwoYh632gvsP5vPDqEKvb-Ywnb8"   # key công khai của Drive web
+
 COOKIE_AUTH_ERROR_KEYWORDS = [
     "cookie",
     "unauthorized",
@@ -931,7 +937,7 @@ class StreamDownloader:
     """
     Cải tiến so với bản gốc:
     - get_video_source trả về VideoStreamSource với timestamp để detect expiry
-    - refresh_source() gọi lại get_video_info để lấy URL mới
+    - refresh_source() gọi lại API playback để lấy URL mới
     - Hỗ trợ fallback tải file tạm khi stream upload thất bại
     """
 
@@ -939,37 +945,125 @@ class StreamDownloader:
         self.session = session
         self.cookie_version = 0
         self.last_error: str | None = None
+        # file_id -> resourceKey, để refresh_source() dùng lại key đã biết.
+        self.resource_keys: dict[str, str] = {}
 
-    def get_video_source(self, file_id: str) -> VideoStreamSource:
-        self.last_error = None
-        info_resp = self.session.get(
-            stream_dl.DRIVE_VIDEO_INFO_URL,
-            params={"docid": file_id, "authuser": "0"},
-            timeout=30,
+    def _sapisid_authorization(self) -> str | None:
+        """Header Authorization mà Drive web gửi cho các API *.clients6.google.com.
+
+        Thiếu header này, endpoint playback chỉ thấy phiên ẩn danh và trả
+        "permission denied on media item" dù cookie còn sống.
+        """
+        values = {c.name: c.value for c in self.session.cookies}
+        sapisid = (
+            values.get("SAPISID")
+            or values.get("__Secure-3PAPISID")
+            or values.get("__Secure-1PAPISID")
         )
-        if info_resp.status_code >= 400:
+        if not sapisid:
+            return None
+        ts = int(time.time())
+        digest = hashlib.sha1(
+            f"{ts} {sapisid} {DRIVE_WEB_ORIGIN}".encode()
+        ).hexdigest()
+        return f"SAPISIDHASH {ts}_{digest} SAPISID1PHASH {ts}_{digest}"
+
+    def _fetch_playback_info(self, file_id: str, resource_key: str | None) -> dict:
+        """Lấy danh sách luồng video qua API playback mà trình phát Drive đang dùng.
+
+        Google đã gỡ drive.google.com/get_video_info (trả 404 cho mọi file kể
+        cả khi cookie còn sống), nên phải đi qua workspacevideo-pa. Thử lần
+        lượt các authuser vì tài khoản có quyền xem có thể không phải số 0.
+        """
+        auth = self._sapisid_authorization()
+        if not auth:
             raise RuntimeError(
-                f"Không lấy được video info (HTTP {info_resp.status_code}). "
-                "Cookie có thể đã hết hạn hoặc không đủ quyền truy cập."
+                "Cookie thiếu SAPISID — không xác thực được với API playback của Drive."
+            )
+        headers = {
+            "Authorization": auth,
+            "Origin":        DRIVE_WEB_ORIGIN,
+            "Referer":       f"{DRIVE_WEB_ORIGIN}/",
+            "Accept":        "application/json",
+        }
+        if resource_key:
+            headers["X-Goog-Drive-Resource-Keys"] = f"{file_id}/{resource_key}"
+
+        statuses = []
+        for authuser in ("0", "1", "2", "3"):
+            resp = self.session.get(
+                DRIVE_PLAYBACK_URL.format(file_id=file_id),
+                params={"key": DRIVE_PLAYBACK_API_KEY},
+                headers={**headers, "X-Goog-AuthUser": authuser},
+                timeout=30,
+            )
+            try:
+                if resp.status_code == 200:
+                    return resp.json()
+                try:
+                    message = resp.json().get("error", {}).get("message", "")
+                except ValueError:
+                    message = ""
+                statuses.append(
+                    f"authuser={authuser}: HTTP {resp.status_code} {message}".strip()
+                )
+                if resp.status_code not in (401, 403, 404):
+                    break
+            finally:
+                resp.close()
+
+        # 401 = phiên web không còn hợp lệ → để looks_like_cookie_auth_error
+        # bắt được và mời thay cookie. 403/404 là lỗi quyền xem của tài khoản,
+        # thay cookie cùng tài khoản không giúp được gì nên tránh từ khoá đó.
+        detail = "; ".join(statuses)
+        if statuses and all(" 401" in st for st in statuses):
+            raise RuntimeError(f"Cookie hết hạn — API playback trả 401 ({detail}).")
+        raise RuntimeError(
+            f"Không lấy được luồng video ({detail}). Tài khoản web đang đăng nhập "
+            "không xem được file này hoặc Drive chưa xử lý xong video."
+        )
+
+    def get_video_source(
+        self, file_id: str, resource_key: str | None = None
+    ) -> VideoStreamSource:
+        self.last_error = None
+        if resource_key:
+            self.resource_keys[file_id] = resource_key
+        else:
+            resource_key = self.resource_keys.get(file_id)
+        info = self._fetch_playback_info(file_id, resource_key)
+
+        # Chỉ dùng progressiveTranscodes: mỗi luồng là một MP4 đủ hình + tiếng.
+        # adaptiveTranscodes tách riêng video/audio, phải ghép lại mới xem được.
+        progressive = (
+            info.get("mediaStreamingData", {})
+            .get("formatStreamingData", {})
+            .get("progressiveTranscodes", [])
+        )
+        streams = [
+            stream_dl.VideoStream(itag=str(t.get("itag", "")), url=t["url"])
+            for t in progressive
+            if t.get("url")
+        ]
+        if not streams:
+            raise RuntimeError(
+                "Không tìm thấy luồng video MP4 (progressiveTranscodes rỗng)."
             )
 
-        from urllib.parse import parse_qs
-        info   = parse_qs(info_resp.text, keep_blank_values=True)
-        status = stream_dl.first_value(info, "status")
-        if status and status.lower() != "ok":
-            reason = stream_dl.first_value(info, "reason") or "Không có luồng video"
-            raise RuntimeError(f"Lỗi lấy video stream: {reason}")
-
-        streams = stream_dl.parse_video_streams(info)
-        if not streams:
-            raise RuntimeError("Không tìm thấy stream URL (streams list rỗng).")
-
         best   = stream_dl.choose_video_stream(streams)
+        referer = f"https://drive.google.com/file/d/{file_id}/preview"
+        if resource_key:
+            referer += f"?resourcekey={resource_key}"
         headers = {
-            "Referer":         f"https://drive.google.com/file/d/{file_id}/preview",
+            "Referer":         referer,
             "Accept":          "*/*",
             "Accept-Encoding": "identity",
         }
+        # URL luồng gắn với User-Agent đã gọi API playback: client khác UA
+        # (vd. aiohttp trong IDMDownloader) sẽ nhận 403.
+        user_agent = self.session.headers.get("User-Agent")
+        if user_agent:
+            headers["User-Agent"] = user_agent
 
         # Probe để lấy kích thước và kiểm tra Range support
         probe_headers = {**headers, "Range": "bytes=0-0"}
@@ -1017,12 +1111,13 @@ class StreamDownloader:
             return None
 
     def download_to_temp(
-        self, file_id: str, suffix: str = ".mp4", display_name: str | None = None
+        self, file_id: str, suffix: str = ".mp4", display_name: str | None = None,
+        resource_key: str | None = None,
     ) -> Optional[Path]:
         """Fallback: tải file về đĩa tạm khi upload stream thất bại."""
         self.last_error = None
         try:
-            source = self.get_video_source(file_id)
+            source = self.get_video_source(file_id, resource_key)
         except Exception as e:
             self.last_error = str(e)
             UI.warn(f"Không lấy được stream URL: {e}", indent=4)
@@ -1088,7 +1183,7 @@ class DriveAPI:
                 resp = self.service.files().list(
                     q=f"'{folder_id}' in parents and trashed = false",
                     pageSize=1000,
-                    fields="files(id,name,mimeType,size,modifiedTime,shortcutDetails),nextPageToken",
+                    fields="files(id,name,mimeType,size,modifiedTime,resourceKey,shortcutDetails),nextPageToken",
                     pageToken=page_token,
                     corpora="allDrives",
                     supportsAllDrives=True,
@@ -1151,7 +1246,7 @@ class DriveAPI:
         try:
             return self.service.files().get(
                 fileId=file_id,
-                fields="id,name,mimeType,size,modifiedTime,parents,trashed,shortcutDetails",
+                fields="id,name,mimeType,size,modifiedTime,resourceKey,parents,trashed,shortcutDetails",
                 supportsAllDrives=True,
             ).execute()
         except HttpError:
@@ -2524,6 +2619,7 @@ class SyncEngine:
                 return self._handle_blocked_video(
                         api, streamer, dest_parent_id, name,
                         file_id, mime_type, checkpoint_key or file_id,
+                        resource_key=src_file.get("resourceKey"),
                 )
 
         # D. PDF/non-video bị block → Playwright viewer capture
@@ -2607,13 +2703,16 @@ class SyncEngine:
         self, api: DriveAPI, streamer: StreamDownloader,
         dest_parent_id: str, name: str,
         file_id: str, mime_type: str, checkpoint_key: str | None = None,
+        resource_key: str | None = None,
     ) -> bool:
         # Áp dụng kiến trúc IDM: Ưu tiên tải đa luồng về đĩa tạm để tối đa tốc độ
         UI.status("FALLBACK", f"{name} — tải file tạm (IDM 8 luồng) rồi upload...", indent=4)
         suffix = Path(name).suffix or ".mp4"
         tmp_path = None
         for attempt in range(1, self.config.RETRY_TIMES + 1):
-            tmp_path = streamer.download_to_temp(file_id, suffix=suffix, display_name=name)
+            tmp_path = streamer.download_to_temp(
+                file_id, suffix=suffix, display_name=name, resource_key=resource_key
+            )
             if tmp_path is not None:
                 break
             if looks_like_cookie_auth_error(streamer.last_error or ""):
