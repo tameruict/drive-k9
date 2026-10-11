@@ -260,6 +260,15 @@ class DrivePlaybackError(DownloadError):
         self.status_codes = status_codes
 
 
+class DriveVideoUnavailableError(DownloadError):
+    """Video không thể có luồng phát: thử lại hay đổi cookie đều vô ích.
+
+    Gặp khi Drive không mã hoá được file nguồn (ENCODING_FAILED_*) hoặc file
+    quá nhỏ để là video thật (vài chục byte). File view-only như vậy cũng không
+    copy/tải trực tiếp được nên không còn đường nào để sao chép.
+    """
+
+
 class CookieRefreshState:
     def __init__(self, cookie_file: Optional[str]):
         self.lock = threading.Lock()
@@ -1129,6 +1138,11 @@ def fetch_drive_playback_streams(
                 message = response.json().get("error", {}).get("message", "")
             except ValueError:
                 message = ""
+            if response.status_code == 400 and "too small to be playable" in message:
+                raise DriveVideoUnavailableError(
+                    "File nguồn quá nhỏ để là video thật (file hỏng/giả), "
+                    f"Drive không thể phát: {message}"
+                )
             status_codes.append(response.status_code)
             failures.append(f"authuser={authuser}: HTTP {response.status_code} {message}".strip())
             if response.status_code not in (401, 403, 404):
@@ -1140,18 +1154,26 @@ def fetch_drive_playback_streams(
             f"Không lấy được luồng video ({'; '.join(failures)})", status_codes
         )
 
-    transcodes = (
-        info.get("mediaStreamingData", {})
-        .get("formatStreamingData", {})
-        .get("progressiveTranscodes", [])
-    )
+    streaming = info.get("mediaStreamingData", {})
+    transcodes = streaming.get("formatStreamingData", {}).get("progressiveTranscodes", [])
     streams = [
         VideoStream(itag=str(item.get("itag", "")), url=item["url"])
         for item in transcodes
         if item.get("url")
     ]
     if not streams:
-        raise DownloadError("Không tìm thấy luồng video MP4 (progressiveTranscodes rỗng).")
+        availability = streaming.get("transcodeAvailabilityState", {})
+        state = availability.get("state", "")
+        if state.startswith("ENCODING_FAILED"):
+            detail = availability.get("localizedMessage", {}).get("message") or availability.get("message", "")
+            raise DriveVideoUnavailableError(
+                f"Drive không mã hoá được video nguồn ({state}): {detail}"
+            )
+        raise DownloadError(
+            "Không tìm thấy luồng video MP4 (progressiveTranscodes rỗng"
+            + (f", trạng thái {state}" if state else "")
+            + ")."
+        )
     return streams
 
 
