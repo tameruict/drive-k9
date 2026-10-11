@@ -1,6 +1,9 @@
-name: Drive K9 Manual Sync
+name: Drive K9 Sync
 
 on:
+  schedule:
+    # 22:00 giờ Việt Nam (UTC+7) mỗi ngày. GitHub có thể trễ vài phút đến vài chục phút khi tải cao.
+    - cron: "0 15 * * *"
   workflow_dispatch:
     inputs:
       source_folder_ids:
@@ -42,9 +45,10 @@ jobs:
     timeout-minutes: 360
 
     env:
-      SOURCE_FOLDER_IDS: ${{ inputs.source_folder_ids }}
-      DEST_FOLDER_ID: ${{ inputs.dest_folder_id }}
-      MAX_WORKERS: ${{ inputs.max_workers }}
+      # Lần chạy theo lịch không có inputs nên dùng giá trị mặc định.
+      SOURCE_FOLDER_IDS: ${{ inputs.source_folder_ids || '107CZgk5F7iRX_b9Esa1avdOEkwTIMKIh' }}
+      DEST_FOLDER_ID: ${{ inputs.dest_folder_id || '1O3DFShrB_4XvuaGl1U3C0qJ0QyOuyGvi' }}
+      MAX_WORKERS: ${{ inputs.max_workers || '6' }}
       MAX_STREAM_WORKERS: "4"
       MAX_PDF_WORKERS: "1"
       FORCE_FULL_SCAN: ${{ inputs.force_full_scan && '1' || '0' }}
@@ -104,6 +108,28 @@ jobs:
           (runner_temp / "cookie.txt").write_text(cookie, encoding="utf-8")
           PY
 
+      - name: Check and refresh Google cookie
+        id: cookie
+        continue-on-error: true
+        env:
+          SECRETS_PAT: ${{ secrets.SECRETS_PAT }}
+        run: |
+          if [ -n "$SECRETS_PAT" ]; then
+            python cookie_maintenance.py --cookie-file "$RUNNER_TEMP/cookie.txt" --rotate
+          else
+            echo "::warning::Chưa có secret SECRETS_PAT nên không tự làm mới cookie (không lưu lại được cookie mới)."
+            python cookie_maintenance.py --cookie-file "$RUNNER_TEMP/cookie.txt"
+          fi
+
+      - name: Save refreshed cookie to DRIVE_COOKIE
+        if: steps.cookie.outputs.rotated == '1'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.SECRETS_PAT }}
+        run: |
+          gh secret set DRIVE_COOKIE --repo "$GITHUB_REPOSITORY" < "$RUNNER_TEMP/cookie.txt"
+          echo "Đã lưu cookie mới vào secret DRIVE_COOKIE."
+
       - name: Run Drive K9 sync
         run: |
           python windows_sync_tool_improved.py \
@@ -116,4 +142,15 @@ jobs:
         if: always()
         run: |
           rm -f "$RUNNER_TEMP/token.json" "$RUNNER_TEMP/cookie.txt"
+
+      # Đánh fail run (GitHub gửi email báo lỗi) để cookie chết không bị lặng lẽ bỏ qua.
+      - name: Fail if Google cookie is unusable
+        if: always() && (steps.cookie.outcome == 'failure' || steps.cookie.outputs.signed_in == '0')
+        run: |
+          if [ "${{ steps.cookie.outputs.signed_in }}" = "0" ]; then
+            echo "::error::Cookie DRIVE_COOKIE đã bị Google đăng xuất — video bị chặn tải không được. Xuất cookie mới của tài khoản đích rồi cập nhật secret DRIVE_COOKIE."
+          else
+            echo "::error::Không kiểm tra được cookie DRIVE_COOKIE — xem log bước 'Check and refresh Google cookie'."
+          fi
+          exit 1
 
