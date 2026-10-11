@@ -147,6 +147,46 @@ class PlaybackSourceTests(unittest.TestCase):
         with self.assertRaises(sync_tool.stream_dl.DownloadError):
             sync_tool.stream_dl.fetch_drive_playback_streams(session, FILE_ID)
 
+    def test_encoding_failed_source_is_unrecoverable(self):
+        session = make_session()
+        payload = {
+            "mediaStreamingData": {
+                "transcodeAvailabilityState": {
+                    "state": "ENCODING_FAILED_SYSTEM_ERROR",
+                    "localizedMessage": {"message": "Drive failed to make this video file playable"},
+                }
+            }
+        }
+        streamer = sync_tool.StreamDownloader(session)
+
+        with patch.object(session, "get", return_value=FakeResponse(200, payload)):
+            with self.assertRaises(RuntimeError) as ctx:
+                streamer.get_video_source(FILE_ID)
+
+        self.assertTrue(streamer.unrecoverable)
+        self.assertIn("ENCODING_FAILED_SYSTEM_ERROR", str(ctx.exception))
+
+    def test_too_small_video_is_unrecoverable(self):
+        session = make_session()
+        error = {"error": {"message": f"media item {FILE_ID} of type VIDEO is too small to be playable"}}
+        streamer = sync_tool.StreamDownloader(session)
+
+        with patch.object(session, "get", return_value=FakeResponse(400, error)):
+            with self.assertRaises(RuntimeError):
+                streamer.get_video_source(FILE_ID)
+
+        self.assertTrue(streamer.unrecoverable)
+
+    def test_transient_failure_stays_retryable(self):
+        session = make_session()
+        streamer = sync_tool.StreamDownloader(session)
+
+        with patch.object(session, "get", return_value=FakeResponse(403, {"error": {"message": "x"}})):
+            with self.assertRaises(RuntimeError):
+                streamer.get_video_source(FILE_ID)
+
+        self.assertFalse(streamer.unrecoverable)
+
 
 if __name__ == "__main__":
     unittest.main()

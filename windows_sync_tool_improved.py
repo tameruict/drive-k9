@@ -939,6 +939,8 @@ class StreamDownloader:
         self.session = session
         self.cookie_version = 0
         self.last_error: str | None = None
+        # True khi lỗi là vĩnh viễn (video nguồn hỏng/không mã hoá được): retry vô ích.
+        self.unrecoverable = False
         # file_id -> resourceKey, để refresh_source() dùng lại key đã biết.
         self.resource_keys: dict[str, str] = {}
 
@@ -960,6 +962,9 @@ class StreamDownloader:
                 f"{e}. Tài khoản web đang đăng nhập không xem được file này "
                 "hoặc Drive chưa xử lý xong video."
             ) from e
+        except stream_dl.DriveVideoUnavailableError as e:
+            self.unrecoverable = True
+            raise RuntimeError(f"Video nguồn không thể sao chép: {e}") from e
         except stream_dl.DownloadError as e:
             raise RuntimeError(str(e)) from e
 
@@ -967,6 +972,7 @@ class StreamDownloader:
         self, file_id: str, resource_key: str | None = None
     ) -> VideoStreamSource:
         self.last_error = None
+        self.unrecoverable = False
         if resource_key:
             self.resource_keys[file_id] = resource_key
         else:
@@ -2643,6 +2649,8 @@ class SyncEngine:
                     UI.status("COOKIE", f"Đã thay cookie, retry fallback: {name}", indent=4)
                     continue
             UI.warn(f"IDM download fail attempt={attempt} {name}", indent=4)
+            if streamer.unrecoverable:
+                break
             if attempt < self.config.RETRY_TIMES:
                 time.sleep(exponential_backoff(attempt))
 
