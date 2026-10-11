@@ -67,7 +67,6 @@ from urllib3.util.retry import Retry
 DRIVE_UC_URL = "https://drive.google.com/uc"
 DRIVE_VIEW_URL = "https://drive.google.com/file/d/{file_id}/view"
 DRIVE_PREVIEW_URL = "https://drive.google.com/file/d/{file_id}/preview"
-DRIVE_VIDEO_INFO_URL = "https://drive.google.com/get_video_info"
 DEFAULT_TOKEN_PATH = "token.json"
 
 # CSS class of the Drive PDF viewer's scrollable container.

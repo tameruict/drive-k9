@@ -126,6 +126,27 @@ class PlaybackSourceTests(unittest.TestCase):
 
         self.assertEqual(seen["X-Goog-Drive-Resource-Keys"], f"{FILE_ID}/rk-123")
 
+    def test_unexpected_status_stops_without_crashing(self):
+        session = make_session()
+        authusers = []
+
+        def fake_get(url, **kwargs):
+            authusers.append(kwargs["headers"]["X-Goog-AuthUser"])
+            return FakeResponse(500)
+
+        with patch.object(session, "get", side_effect=fake_get):
+            with self.assertRaises(sync_tool.stream_dl.DrivePlaybackError) as ctx:
+                sync_tool.stream_dl.fetch_drive_playback_streams(session, FILE_ID)
+
+        self.assertEqual(authusers, ["0"])
+        self.assertEqual(ctx.exception.status_codes, [500])
+
+    def test_missing_sapisid_is_reported(self):
+        session = requests.Session()
+
+        with self.assertRaises(sync_tool.stream_dl.DownloadError):
+            sync_tool.stream_dl.fetch_drive_playback_streams(session, FILE_ID)
+
 
 if __name__ == "__main__":
     unittest.main()
